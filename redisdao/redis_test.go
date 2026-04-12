@@ -12,18 +12,25 @@ import (
 var testStrKey = "redisdao_test_name"
 
 func TestNewSimpleRedis(t *testing.T) {
-
 	// load local conf.ini
 	dir, _ := os.Getwd()
 	config.SetConfigPath(dir + "/conf/conf.ini")
 
-	// reset init redis
-	// initRedis()
-
 	ctx := context.Background()
 	client := NewSimpleRedis("redis")
 
-	err := client.Set(ctx, testStrKey, "wanglele", time.Duration(30*time.Second)).Err()
+	// 检查客户端是否初始化成功
+	if client == nil {
+		t.Skip("Redis 客户端初始化失败（配置不存在），跳过集成测试")
+	}
+
+	// 检查是否能连接到 Redis，如果不能则跳过测试
+	_, err := client.Ping(ctx).Result()
+	if err != nil {
+		t.Skip("Redis 连接失败，跳过集成测试:", err)
+	}
+
+	err = client.Set(ctx, testStrKey, "wanglele", time.Duration(30*time.Second)).Err()
 	if err != nil {
 		t.Error("fail")
 	} else {
