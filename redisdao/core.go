@@ -129,7 +129,7 @@ func initRedis() {
 			options.Password = p
 		}
 
-		if p := config.GetConf("RedisConfig", k+".tlsinsecureskip"); p != "" {
+		if p := config.GetConf("RedisConfig", k+".tlsinsecureskip"); p == "true" {
 			options.TLSConfig = &tls.Config{InsecureSkipVerify: true}
 		}
 

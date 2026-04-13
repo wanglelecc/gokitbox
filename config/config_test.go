@@ -2,6 +2,7 @@ package config
 
 import (
 	"os"
+	"sync"
 	"testing"
 )
 
@@ -217,4 +218,93 @@ func TestSetConfigPath(t *testing.T) {
 			SetConfigPath(tt.path)
 		})
 	}
+}
+
+// TestLoadUnknownAnySource 验证 C-1 修复：未注册的 any source 返回 error 而非 panic
+func TestLoadUnknownAnySource(t *testing.T) {
+	_, err := Load("non_existent_source")
+	if err == nil {
+		t.Fatal("Load() with unknown any source should return error, got nil")
+	}
+}
+
+// TestLoadYmlExtension 验证 config 重构：.yml 后缀文件被识别为 YAML
+func TestLoadYmlExtension(t *testing.T) {
+	dir, _ := os.Getwd()
+	ymlPath := dir + "/config/app.yml"
+
+	cfg, err := Load(ymlPath)
+	if err != nil {
+		t.Fatalf("Load() .yml file failed: %v", err)
+	}
+	if cfg == nil {
+		t.Fatal("Load() .yml file returned nil config")
+	}
+	name := cfg.MustValue("goconfig", "name", "")
+	if name != "goyml" {
+		t.Errorf("Load() .yml name = %q, want %q", name, "goyml")
+	}
+}
+
+// TestLoadYamlExtension 验证 .yaml 后缀文件识别（回归测试）
+func TestLoadYamlExtension(t *testing.T) {
+	dir, _ := os.Getwd()
+	yamlPath := dir + "/config/app.yaml"
+
+	cfg, err := Load(yamlPath)
+	if err != nil {
+		t.Fatalf("Load() .yaml file failed: %v", err)
+	}
+	name := cfg.MustValue("goconfig", "name", "")
+	if name != "goyaml" {
+		t.Errorf("Load() .yaml name = %q, want %q", name, "goyaml")
+	}
+}
+
+// TestConcurrentInitConfig 验证并发 InitConfig 不发生 data race（需配合 -race）
+func TestConcurrentInitConfig(t *testing.T) {
+	dir, _ := os.Getwd()
+	// 重置状态
+	ClearConfigCache()
+	SetConfigPath(dir + "/config/app.yaml")
+
+	const goroutines = 20
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+	for i := 0; i < goroutines; i++ {
+		go func() {
+			defer wg.Done()
+			InitConfig()
+			_ = GetConf("goconfig", "name")
+		}()
+	}
+	wg.Wait()
+
+	// 恢复原始路径，不影响其他测试
+	SetConfigPath(dir + "/config/app.yaml")
+}
+
+// TestSetConfigPathResetsGCfg 验证 SetConfigPath 正确重置全局配置
+func TestSetConfigPathResetsGCfg(t *testing.T) {
+	dir, _ := os.Getwd()
+
+	// 先初始化
+	SetConfigPath(dir + "/config/app.yaml")
+	InitConfig()
+	before := GetConf("goconfig", "name")
+	if before == "" {
+		t.Fatal("config not loaded before reset")
+	}
+
+	// 重置为不存在的路径，再次 GetConf 应返回空
+	SetConfigPath("/tmp/nonexistent_config_test.yaml")
+	ClearConfigCache()
+	val := GetConf("goconfig", "name")
+	if val != "" {
+		t.Errorf("after SetConfigPath to nonexistent, GetConf should return empty, got %q", val)
+	}
+
+	// 恢复
+	SetConfigPath(dir + "/config/app.yaml")
+	ClearConfigCache()
 }

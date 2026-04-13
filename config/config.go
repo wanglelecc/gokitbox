@@ -44,6 +44,9 @@ var (
 	// the "any" pattern can customize the data source by register a plugin
 	anyFileMap = make(map[string]func() (Config, error), 0)
 
+	// gCfgMu 保护 gCfg 和 configFilename 的并发读写
+	gCfgMu sync.RWMutex
+
 	// global config
 	gCfg Config
 
@@ -54,27 +57,30 @@ var (
 )
 
 func SetConfigPath(path string) {
+	gCfgMu.Lock()
 	configFilename = path
 	gCfg = nil
+	gCfgMu.Unlock()
 }
 
 func InitConfig() {
-	// check if config has inited
+	// 快路径：已初始化
+	gCfgMu.RLock()
+	if gCfg != nil {
+		gCfgMu.RUnlock()
+		return
+	}
+	gCfgMu.RUnlock()
+
+	// 升级为写锁，double-check 后再执行初始化
+	gCfgMu.Lock()
+	defer gCfgMu.Unlock()
 	if gCfg != nil {
 		return
 	}
 
-	var configPath string
+	configPath := configFilename
 	var err error
-
-	// set the default path
-	if len(configPath) == 0 {
-		configPath = configFilename
-	}
-
-	// log.Printf("config ini path: %s", configPath)
-
-	// load config from path
 	if gCfg, err = Load(configPath); err != nil {
 		gCfg = nil
 		log.Printf("config error: %v", err)
@@ -127,13 +133,21 @@ func SetConfPathPrefix(fullPathPrefix string) {
 	}
 }
 
+// globalCfg 在锁保护下返回当前全局配置，供 Get* 系列统一使用
+func globalCfg() Config {
+	gCfgMu.RLock()
+	defer gCfgMu.RUnlock()
+	return gCfg
+}
+
 func Set(section, key string, value interface{}) {
 	InitConfig()
-	if gCfg == nil {
+	cfg := globalCfg()
+	if cfg == nil {
 		log.Printf("config error: NOT_FOUND[sec:%s,key:%s]", section, key)
 		return
 	}
-	gCfg.Set(section, key, value)
+	cfg.Set(section, key, value)
 }
 
 func Load(path string) (cfg Config, err error) {
@@ -141,21 +155,27 @@ func Load(path string) (cfg Config, err error) {
 	// path is not a valid path
 	if !strings.Contains(path, "/") {
 		fn := anyFileMap[path]
+		if fn == nil {
+			err = errors.New("unknown config source: " + path)
+			return
+		}
 		cfg, err = fn()
 		return
 	}
 
-	if len([]byte(path)) < 4 {
+	if len(path) < 2 {
 		return nil, errors.New("path invalid")
 	}
 
-	// default load module
+	// 用 filepath.Ext 检测文件类型，支持 .yaml / .yml / .ini
 	fileType := "ini"
-
-	if path[len(path)-4:] == "yaml" {
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".yaml", ".yml":
 		fileType = "yaml"
-		// if the path suffix is not ".ini", completed path by append ".ini"
-	} else if path[len(path)-4:] != ".ini" {
+	case ".ini":
+		// 已是 ini，无需处理
+	default:
+		// 无扩展名或未知扩展名，补 .ini 后缀
 		path = path + ".ini"
 	}
 	// config cache
@@ -189,6 +209,12 @@ func Load(path string) (cfg Config, err error) {
 
 		// load file and create cache
 		configCache.Lock()
+		// double-check：升级为写锁期间可能已被其他 goroutine 加载
+		if cached, exists := configCache.cache[path]; exists {
+			configCache.Unlock()
+			cfg = cached
+			return
+		}
 		if fileType == "yaml" {
 			if cfg, err = loadYamlFile(path); err == nil {
 				configCache.cache[path] = cfg
@@ -209,87 +235,78 @@ func Load(path string) (cfg Config, err error) {
 func ClearConfigCache() {
 	configCache.Lock()
 	configCache.cache = make(map[string]Config, 0)
-	gCfg = nil
 	configCache.Unlock()
+
+	gCfgMu.Lock()
+	gCfg = nil
+	gCfgMu.Unlock()
 }
 
 func GetConf(sec, key string) string {
-	// init
 	InitConfig()
-	if gCfg == nil {
+	cfg := globalCfg()
+	if cfg == nil {
 		log.Printf("config error: NOT_FOUND[sec:%s,key:%s]", sec, key)
 		return ""
 	}
-	// if value not existed return ""
-	return gCfg.MustValue(sec, key, "")
+	return cfg.MustValue(sec, key, "")
 }
 
 func GetConfDefault(sec, key, def string) string {
-	// init
 	InitConfig()
-	if gCfg == nil {
+	cfg := globalCfg()
+	if cfg == nil {
 		log.Printf("config error: NOT_FOUND[sec:%s,key:%s]", sec, key)
 		return ""
 	}
-	// if value not existed return def
-	return gCfg.MustValue(sec, key, def)
+	return cfg.MustValue(sec, key, def)
 }
 
 func GetConfArr(sec, key string) []string {
-	// init
 	InitConfig()
-	if gCfg == nil {
+	cfg := globalCfg()
+	if cfg == nil {
 		log.Printf("config error: NOT_FOUND[sec:%s,key:%s]", sec, key)
 		return []string{}
 	}
-
-	// if value not existed return " "
-	return gCfg.MustValueArray(sec, key, " ")
+	return cfg.MustValueArray(sec, key, " ")
 }
 
 func GetConfStringMap(sec string) (ret map[string]string) {
-	// init
 	InitConfig()
-	if gCfg == nil {
+	cfg := globalCfg()
+	if cfg == nil {
 		log.Printf("config error: NOT_FOUND[sec:%s]", sec)
 		return nil
 	}
-
 	var err error
-	// if value not existed return empty map
-	if ret, err = gCfg.GetSection(sec); err != nil {
+	if ret, err = cfg.GetSection(sec); err != nil {
 		log.Printf("config,err:%v", err)
 		ret = make(map[string]string, 0)
 	}
-
 	return
 }
 
 func GetConfArrayMap(sec string) (ret map[string][]string) {
-	// init
 	InitConfig()
-	if gCfg == nil {
+	cfg := globalCfg()
+	if cfg == nil {
 		log.Printf("config error: NOT_FOUND[sec:%s]", sec)
 		return nil
 	}
 	ret = make(map[string][]string, 0)
-	// get all keys
-	confs := gCfg.GetKeyList(sec)
-	// get all config by range keys
-	for _, k := range confs {
-		ret[k] = gCfg.MustValueArray(sec, k, " ")
+	for _, k := range cfg.GetKeyList(sec) {
+		ret[k] = cfg.MustValueArray(sec, k, " ")
 	}
-
 	return
 }
 
 func ConfMapToStruct(sec string, v interface{}) error {
-	// init
 	InitConfig()
-	if gCfg == nil {
+	cfg := globalCfg()
+	if cfg == nil {
 		log.Printf("config error: NOT_FOUND[sec:%s]", sec)
 		return nil
 	}
-
-	return gCfg.GetSectionObject(sec, v)
+	return cfg.GetSectionObject(sec, v)
 }

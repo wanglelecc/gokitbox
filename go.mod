@@ -1,6 +1,6 @@
 module github.com/wanglelecc/gokitbox
 
-go 1.26.1
+go 1.25.0
 
 require (
 	github.com/bwmarrin/snowflake v0.3.0
@@ -11,7 +11,6 @@ require (
 	github.com/go-playground/universal-translator v0.18.1
 	github.com/go-playground/validator/v10 v10.30.2
 	github.com/go-sql-driver/mysql v1.9.3
-	github.com/go-xorm/xorm v0.7.9
 	github.com/kardianos/osext v0.0.0-20190222173326-2bc1f35cddc0
 	github.com/natefinch/lumberjack v2.0.0+incompatible
 	github.com/petermattis/goid v0.0.0-20260330135022-df67b199bc81
@@ -32,7 +31,7 @@ require (
 	go.uber.org/zap v1.27.1
 	golang.org/x/crypto v0.50.0
 	gopkg.in/yaml.v2 v2.4.0
-	xorm.io/core v0.7.3
+	xorm.io/xorm v1.3.11
 )
 
 require (
@@ -104,6 +103,7 @@ require (
 	github.com/smallnest/rsocket v0.0.0-20241130031020-4a72eb6ff62a // indirect
 	github.com/smartystreets/goconvey v1.8.1 // indirect
 	github.com/soheilhy/cmux v0.1.5 // indirect
+	github.com/syndtr/goleveldb v1.0.0 // indirect
 	github.com/templexxx/cpufeat v0.0.0-20180724012125-cef66df7f161 // indirect
 	github.com/templexxx/xor v0.0.0-20191217153810-f85b25db303b // indirect
 	github.com/tidwall/match v1.1.1 // indirect
@@ -135,5 +135,5 @@ require (
 	google.golang.org/grpc v1.79.3 // indirect
 	google.golang.org/protobuf v1.36.11 // indirect
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1 // indirect
-	xorm.io/builder v0.3.6 // indirect
+	xorm.io/builder v0.3.13 // indirect
 )

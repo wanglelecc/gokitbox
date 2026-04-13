@@ -134,14 +134,14 @@ func Guid() string {
 	return MD5(base64.URLEncoding.EncodeToString(b))
 }
 
-// SignByAscii 将 map 的 key 按 ASCII 升序排列后拼接为签名字符串，尾部附加 secret
-// 常用于百度、阿里等开放平台的 API 签名算法
+// SignByAscii 将 map 的 key 按 ASCII 升序排列后拼接为签名字符串，使用 HMAC-SHA256 签名
+// 常用于开放平台 API 签名场景
 //
 // 使用示例：
 //
 //	params := map[string]string{"b": "2", "a": "1", "sign": "xxx"}
 //	sig := uHash.SignByAscii(params, "my_secret", "sign")
-//	// sig = MD5("a=1&b=2&my_secret")
+//	// sig = HMAC-SHA256("a=1&b=2", "my_secret")，返回 64 位十六进制字符串
 func SignByAscii(params map[string]string, secret string, exceptKeys ...string) string {
 	excluded := make(map[string]struct{}, len(exceptKeys))
 	for _, k := range exceptKeys {
@@ -165,7 +165,6 @@ func SignByAscii(params map[string]string, secret string, exceptKeys ...string) 
 		sb.WriteByte('=')
 		sb.WriteString(params[k])
 	}
-	sb.WriteString(secret)
 
-	return MD5(sb.String())
+	return HmacSHA256(sb.String(), secret)
 }

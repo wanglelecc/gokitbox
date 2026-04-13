@@ -1,8 +1,9 @@
 package uNo
 
 import (
+	"crypto/rand"
 	"fmt"
-	"math/rand"
+	"math/big"
 	"strings"
 	"time"
 )
@@ -84,11 +85,12 @@ func generatePay(uid int64, opt Option) string {
 	return opt.Prefix + head + randDigits(randLen) + tail
 }
 
-// randDigits 生成 n 位随机数字字符串
+// randDigits 生成 n 位随机数字字符串（使用 crypto/rand 保证安全性）
 func randDigits(n int) string {
 	b := make([]byte, n)
 	for i := range b {
-		b[i] = byte('0' + rand.Intn(10))
+		num, _ := rand.Int(rand.Reader, big.NewInt(10))
+		b[i] = byte('0') + byte(num.Int64())
 	}
 	return string(b)
 }

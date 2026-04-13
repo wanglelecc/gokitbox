@@ -7,7 +7,7 @@ import (
 	"strconv"
 	"time"
 
-	"xorm.io/core"
+	"xorm.io/xorm/log"
 
 	"github.com/wanglelecc/gokitbox/logger"
 )
@@ -61,11 +61,11 @@ func (d *dbLog) Errorf(format string, v ...interface{}) {
 	logger.Ex(ctx, tag, fmt.Sprintf(format, v...), callerKey, runtimeCaller(skip))
 }
 
-func (d *dbLog) Level() core.LogLevel {
-	return core.LOG_INFO
+func (d *dbLog) Level() log.LogLevel {
+	return log.LOG_INFO
 }
 
-func (d *dbLog) SetLevel(l core.LogLevel) {
+func (d *dbLog) SetLevel(l log.LogLevel) {
 	return
 }
 

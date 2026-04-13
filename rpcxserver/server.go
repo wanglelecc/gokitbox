@@ -61,6 +61,13 @@ type Server struct {
 
 	// 鉴权初始化标记
 	authInitialized sync.Once // 确保只初始化一次鉴权
+
+	// 鉴权数据 - 每实例独立，避免多实例互相覆盖
+	validAuth         map[string]string
+	accessFn          ValidAccess
+	authMu            sync.RWMutex
+	timestampDuration time.Duration
+	durationOnce      sync.Once
 }
 
 // NewServer get server instance
@@ -80,6 +87,8 @@ func NewServer(options ...OptionFunc) *Server {
 		forceShutdown:      true,
 		// 初始化 nonce 集合
 		usedNonces: make(map[string]time.Time),
+		// 初始化鉴权数据
+		validAuth: make(map[string]string),
 	}
 	srv.sigChan = make(chan os.Signal, 10)
 	return srv
@@ -96,6 +105,8 @@ func NewServerWithOptions(opts Options) *Server {
 		forceShutdown:      true,
 		// 初始化 nonce 集合
 		usedNonces: make(map[string]time.Time),
+		// 初始化鉴权数据
+		validAuth: make(map[string]string),
 	}
 	srv.sigChan = make(chan os.Signal, 10)
 	return srv
@@ -396,18 +407,12 @@ func (srv *Server) Close() error {
 
 // ========== 鉴权相关 ==========
 
-var (
-	validAuth map[string]string
-	accessFn  ValidAccess
-	authMutex sync.RWMutex
-)
-
 type ValidAccess func(string) (string, bool)
 
-func validAuthAccess(appId string) (string, bool) {
-	authMutex.RLock()
-	appKey, ok := validAuth[appId]
-	authMutex.RUnlock()
+func (srv *Server) validAuthAccess(appId string) (string, bool) {
+	srv.authMu.RLock()
+	appKey, ok := srv.validAuth[appId]
+	srv.authMu.RUnlock()
 	return appKey, ok
 }
 
@@ -416,17 +421,17 @@ func (srv *Server) InitRpcxAuth(fns ...ValidAccess) bootstrap.BeforeServerStartF
 	return func() error {
 		var initErr error
 		srv.authInitialized.Do(func() {
-			authMutex.Lock()
-			validAuth = config.GetConfStringMap("ValidRpcxAuth")
+			srv.authMu.Lock()
+			srv.validAuth = config.GetConfStringMap("ValidRpcxAuth")
 			srv.server.AuthFunc = func(ctx context.Context, req *protocol.Message, token string) error {
 				return srv.auth(ctx, req, token)
 			}
 			if len(fns) > 0 {
-				accessFn = fns[0]
+				srv.accessFn = fns[0]
 			} else {
-				accessFn = validAuthAccess
+				srv.accessFn = srv.validAuthAccess
 			}
-			authMutex.Unlock()
+			srv.authMu.Unlock()
 
 			// 启动 nonce 清理协程
 			srv.startNonceCleanup()
@@ -450,9 +455,9 @@ func (srv *Server) auth(ctx context.Context, req *protocol.Message, token string
 		appId = token
 	}
 
-	authMutex.RLock()
-	fn := accessFn
-	authMutex.RUnlock()
+	srv.authMu.RLock()
+	fn := srv.accessFn
+	srv.authMu.RUnlock()
 
 	key, ok := fn(appId)
 	if !ok {
@@ -468,7 +473,7 @@ func (srv *Server) auth(ctx context.Context, req *protocol.Message, token string
 		}
 	}
 
-	if !checkTimestamp(cast.ToInt64(timestamp)) {
+	if !srv.checkTimestamp(cast.ToInt64(timestamp)) {
 		return errors.New("expired timestamp")
 	}
 
@@ -496,36 +501,31 @@ func (srv *Server) auth(ctx context.Context, req *protocol.Message, token string
 	return nil
 }
 
-var (
-	timestampValidateDuration time.Duration
-	durationOnce              sync.Once
-)
-
 // checkTimestamp 检查时间戳是否在有效范围内
-func checkTimestamp(ts int64) bool {
-	durationOnce.Do(func() {
-		authMutex.RLock()
-		durationStr, ok := validAuth["timestampValidate"]
-		authMutex.RUnlock()
+func (srv *Server) checkTimestamp(ts int64) bool {
+	srv.durationOnce.Do(func() {
+		srv.authMu.RLock()
+		durationStr, ok := srv.validAuth["timestampValidate"]
+		srv.authMu.RUnlock()
 
 		if ok {
 			duration, err := time.ParseDuration(durationStr)
 			if err == nil {
-				timestampValidateDuration = duration
+				srv.timestampDuration = duration
 				return
 			}
 		}
 		// 默认 2 分钟，比原来的 5 分钟更严格
-		timestampValidateDuration = 2 * time.Minute
+		srv.timestampDuration = 2 * time.Minute
 	})
 
-	if timestampValidateDuration.Seconds() == 0 {
+	if srv.timestampDuration.Seconds() == 0 {
 		return true
 	}
 
 	now := time.Now().Unix()
 	// 使用秒级差值计算，避免 time.Add 的溢出问题
-	durationSec := int64(timestampValidateDuration.Seconds())
+	durationSec := int64(srv.timestampDuration.Seconds())
 	start := now - durationSec
 	end := now + durationSec
 

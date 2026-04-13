@@ -2,6 +2,8 @@ package logger
 
 import (
 	"context"
+
+	"go.uber.org/zap"
 )
 
 type Builder interface {
@@ -15,9 +17,9 @@ type Builder interface {
 
 	SetEnv(env string)
 
-	LoggerX(ctx context.Context, lvl string, tag string, message string, fields ...string)
+	LoggerX(ctx context.Context, lvl string, tag string, message string, fields ...interface{})
 
-	LoggerF(ctx context.Context, lvl string, tag string, message string, fields ...string)
+	LoggerF(ctx context.Context, lvl string, tag string, message string, fields ...interface{})
 
 	Build(ctx context.Context) (expand []interface{})
 
@@ -28,7 +30,7 @@ func SetJoinMod(mod bool) {
 	joinMod = mod
 }
 
-var stdBuilder = new(zapBuilder)
+var stdBuilder = &zapBuilder{zapLogger: zap.NewNop()}
 
 func SetEnv(env string) {
 	stdBuilder.SetEnv(env)
@@ -72,7 +74,7 @@ func Fx(ctx context.Context, tag string, message string, fields ...interface{}) 
 }
 
 func Px(ctx context.Context, tag string, message string, fields ...interface{}) {
-	stdBuilder.LoggerX(ctx, "FATAL", tag, message, fields...)
+	stdBuilder.LoggerX(ctx, "PANIC", tag, message, fields...)
 }
 
 func DebugX(ctx context.Context, tag string, message string, fields ...interface{}) {

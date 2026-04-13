@@ -5,6 +5,9 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
+
+	"go.uber.org/zap"
 )
 
 func TestInitWithConfig(t *testing.T) {
@@ -174,6 +177,69 @@ func TestSetConfigMap(t *testing.T) {
 	}
 	if cfg.Level != "WARN" {
 		t.Errorf("SetConfigMap Level = %s", cfg.Level)
+	}
+}
+
+// TestLoggingBeforeInit 验证 C-2 修复：stdBuilder 使用 zap.NewNop() 初始化，
+// InitWithConfig 调用前打日志不会 panic
+func TestLoggingBeforeInit(t *testing.T) {
+	// 构造一个与 stdBuilder 初始状态相同的 zapBuilder（zapLogger = zap.NewNop()）
+	b := &zapBuilder{zapLogger: zap.NewNop()}
+
+	defer func() {
+		if r := recover(); r != nil {
+			t.Errorf("logging before init caused panic: %v", r)
+		}
+	}()
+
+	ctx := context.Background()
+	b.LoggerW(ctx, true, "INFO", "test", "should not panic")
+}
+
+// TestWithContextSetsRequestTime 验证 H-1 修复：WithContext 正确写入 request_time
+func TestWithContextSetsRequestTime(t *testing.T) {
+	before := time.Now().UnixMilli()
+	ctx := WithContext(context.Background())
+	after := time.Now().UnixMilli()
+
+	val := ctx.Value("request_time")
+	if val == nil {
+		t.Fatal("WithContext() did not set request_time in context")
+	}
+
+	ts, ok := val.(int64)
+	if !ok {
+		t.Fatalf("request_time type = %T, want int64", val)
+	}
+	if ts < before || ts > after {
+		t.Errorf("request_time %d not in expected range [%d, %d]", ts, before, after)
+	}
+}
+
+// TestPxCallsPanic 验证 M-3 修复：Px 调用 PANIC 级别（应触发 panic）
+func TestPxCallsPanic(t *testing.T) {
+	tmpDir := t.TempDir()
+	logFile := filepath.Join(tmpDir, "panic_test.log")
+
+	InitWithConfig(NewConfig().SetConfigMap(map[string]string{
+		"fileName": logFile,
+		"level":    "DEBUG",
+		"console":  "false",
+	}))
+	defer Sync()
+
+	panicked := false
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				panicked = true
+			}
+		}()
+		Px(context.Background(), "test", "panic level test")
+	}()
+
+	if !panicked {
+		t.Error("Px() should trigger a panic (PANIC level), but did not")
 	}
 }
 

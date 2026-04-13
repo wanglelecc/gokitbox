@@ -159,7 +159,7 @@ func (k *CKafka) event() {
 	}
 }
 
-func (k *CKafka) run(quite chan struct{}) {
+func (k *CKafka) run(quit chan struct{}) {
 	defer meta.Recovery()
 
 	ctx := context.Background()
@@ -205,7 +205,7 @@ func (k *CKafka) run(quite chan struct{}) {
 			k.producer.Flush(15 * 1000)
 			k.producer.Close()
 			logger.Ix(ctx, tag+".ProducerOutPut", "KafkaQuit end")
-			close(quite)
+			close(quit)
 			return
 		}
 	}

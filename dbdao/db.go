@@ -1,6 +1,7 @@
 package dbdao
 
 import (
+	"context"
 	"fmt"
 	"sync"
 	"time"
@@ -9,8 +10,8 @@ import (
 	"github.com/wanglelecc/gokitbox/logger"
 
 	_ "github.com/go-sql-driver/mysql"
-	"github.com/go-xorm/xorm"
 	"github.com/spf13/cast"
+	"xorm.io/xorm"
 )
 
 var initOnce sync.Once
@@ -23,7 +24,6 @@ var (
 	dbInstance   map[string]*DBDao
 	curDbPoses   map[string]*uint64 // 当前选择的数据库
 	showSql      bool
-	showExecTime bool
 	slowDuration time.Duration
 	maxConn      int = 100
 	maxIdle      int = 30
@@ -36,7 +36,7 @@ func newDBDaoWithParams(hosts []string, driver string) (Db *DBDao) {
 
 	// 必须先检查错误，再赋值给 Db.Engine
 	if err != nil {
-		logger.Pf(nil, "dbdao", "创建数据库引擎失败 (hosts=%v): %v", hosts, err)
+		logger.Pf(context.Background(), "dbdao", "创建数据库引擎失败 (hosts=%v): %v", hosts, err)
 		panic(fmt.Sprintf("创建数据库引擎失败 (hosts=%v): %v", hosts, err))
 	}
 
@@ -53,7 +53,6 @@ func newDBDaoWithParams(hosts []string, driver string) (Db *DBDao) {
 	Db.Engine.SetMaxIdleConns(maxIdle)
 	Db.Engine.SetConnMaxLifetime(time.Second * 3000)
 	Db.Engine.ShowSQL(showSql)
-	Db.Engine.ShowExecTime(showExecTime)
 	Db.Engine.SetLogger(dbLogger)
 	return
 }
@@ -70,7 +69,6 @@ func initDb() {
 	idc := ""
 	showLog := config.GetConfStringMap("MysqlConfig")
 	showSql = showLog["showSql"] == "true"
-	showExecTime = showLog["showExecTime"] == "true"
 	slowDuration = time.Duration(cast.ToInt(showLog["slowDuration"])) * time.Millisecond
 	maxConnConfig := cast.ToInt(showLog["maxConn"])
 	if maxConnConfig > 0 {

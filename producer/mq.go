@@ -66,6 +66,7 @@ type ProxyManager struct {
 	mqMap map[string]common.MQ
 	quits []chan struct{}
 	exit  chan string
+	done  chan struct{} // 通知 Close 调用方 Run goroutine 已退出
 
 	grayMode bool
 }
@@ -76,6 +77,7 @@ func NewProxyManager() *ProxyManager {
 	pm.grayMode = cast.ToBool(config.GetConfDefault("MQProxy", "grayMode", "false"))
 
 	pm.exit = make(chan string, 1)
+	pm.done = make(chan struct{})
 	pm.input = make(chan []byte, bufferLimit+bufferLimit/2)
 	pm.mqMap = make(map[string]common.MQ)
 
@@ -185,6 +187,7 @@ func (m *ProxyManager) Run() {
 				<-quit
 			}
 
+			close(m.done)
 			return
 		}
 	}
@@ -192,6 +195,7 @@ func (m *ProxyManager) Run() {
 
 func (m *ProxyManager) Close() {
 	m.exit <- "shutdown"
+	<-m.done // 等待 Run goroutine 完成所有 MQ Flush 后再返回
 }
 
 func Close() {

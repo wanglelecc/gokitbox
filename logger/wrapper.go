@@ -51,6 +51,5 @@ func NewContext() context.Context {
 }
 
 func WithContext(ctx context.Context) context.Context {
-	context.WithValue(ctx, "request_time", time.Now().UnixNano()/1e6)
-	return ctx
+	return context.WithValue(ctx, "request_time", time.Now().UnixNano()/1e6)
 }

@@ -148,13 +148,23 @@ func TestGuid(t *testing.T) {
 func TestSignByAscii(t *testing.T) {
 	params := map[string]string{"b": "2", "a": "1", "c": "3"}
 	secret := "my_secret"
-	// 验证不panic
+	// 验证不 panic
 	got := SignByAscii(params, secret)
 	if got == "" {
 		t.Error("SignByAscii() returned empty string")
 	}
-	// 应该是32位MD5
-	if len(got) != 32 {
-		t.Errorf("SignByAscii() length = %d, want 32", len(got))
+	// HMAC-SHA256 输出 64 位十六进制字符串
+	if len(got) != 64 {
+		t.Errorf("SignByAscii() length = %d, want 64", len(got))
+	}
+	// 相同输入结果确定
+	got2 := SignByAscii(params, secret)
+	if got != got2 {
+		t.Error("SignByAscii() not deterministic")
+	}
+	// 排除 key 后结果不同
+	gotExcluded := SignByAscii(params, secret, "c")
+	if gotExcluded == got {
+		t.Error("SignByAscii() with excluded key should differ")
 	}
 }

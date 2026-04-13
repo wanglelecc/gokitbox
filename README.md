@@ -81,8 +81,8 @@ import "github.com/wanglelecc/gokitbox/config"
 name := config.GetConf("app", "name")
 port := config.GetConfDefault("server", "port", "8080")
 
-// 获取数组
-hosts := config.GetConfs("database", "hosts")
+// 获取数组（空格分隔的值自动切分）
+hosts := config.GetConfArr("database", "hosts")
 
 // 映射到结构体
 var cfg ServerConfig
@@ -159,6 +159,8 @@ idStr := uSnowflake.NewIdString() // string
 
 ## 配置文件示例
 
+> 支持 `.ini`、`.yaml`、`.yml` 三种格式，由文件后缀自动识别。
+
 ```ini
 ; 应用配置
 [App]
@@ -196,6 +198,8 @@ redis = localhost:6379
 [RedisConfig]
 redis.db = 0
 redis.poolsize = 100
+; TLS 跳过证书验证（值必须为字符串 "true" 才生效，空值不生效）
+; redis.tlsinsecureskip = true
 
 ; RPC 注册中心
 [Registry]
@@ -253,7 +257,7 @@ gokitbox/
 
 ## 依赖要求
 
-- Go 1.26+
+- Go 1.25+
 - MySQL 5.7+（dbdao）
 - Redis 5.0+（redisdao, uSnowflake）
 - Kafka 2.0+（producer, worker）
