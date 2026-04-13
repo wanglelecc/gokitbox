@@ -1,8 +1,8 @@
 package config
 
 import (
-	"io/ioutil"
 	"log"
+	"os"
 	"strings"
 
 	"github.com/spf13/cast"
@@ -27,7 +27,7 @@ func (this *YamlFile) Set(section, key string, value interface{}) {
 //load yaml file
 func loadYamlFile(path string) (cfg Config, err error) {
 	//read file
-	content, ioerr := ioutil.ReadFile(path)
+	content, ioerr := os.ReadFile(path)
 	if ioerr != nil {
 		err = ioerr
 		log.Printf("loadYamlFile error: %v", ioerr)
@@ -85,14 +85,12 @@ func (this *YamlFile) GetKeyList(section string) []string {
 	if val, err := this.GetSection(section); err != nil {
 		return nil
 	} else {
-		data := make([]string, len(val))
-		for k, _ := range val {
+		data := make([]string, 0, len(val))
+		for k := range val {
 			data = append(data, k)
 		}
 		return data
 	}
-	return nil
-
 }
 
 //empty function

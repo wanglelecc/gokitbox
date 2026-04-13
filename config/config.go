@@ -305,8 +305,7 @@ func ConfMapToStruct(sec string, v interface{}) error {
 	InitConfig()
 	cfg := globalCfg()
 	if cfg == nil {
-		log.Printf("config error: NOT_FOUND[sec:%s]", sec)
-		return nil
+		return errors.New("config not initialized")
 	}
 	return cfg.GetSectionObject(sec, v)
 }

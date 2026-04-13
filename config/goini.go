@@ -34,7 +34,7 @@ func loadIniFile(path string) (cfg Config, err error) {
 //GetSectionObject implemented
 //obj must a pointer
 func (ini *IniFile) GetSectionObject(section string, obj interface{}) error {
-	if ret, err := gCfg.GetSection(section); err != nil {
+	if ret, err := ini.GetSection(section); err != nil {
 		log.Printf("cofnig error: %v", err)
 		return err
 	} else {
