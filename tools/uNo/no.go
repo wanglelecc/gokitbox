@@ -181,3 +181,17 @@ func GenRefundNo(orderId int64, opts ...Option) string {
 func GenWithdrawNo(uid int64, opts ...Option) string {
 	return GenNo("YW", uid, opts...)
 }
+
+// GenYearWeekNo 生成当前年份的后两位与 ISO 周数组成的编号字符串
+//
+// 常用于按周归档、批次号生成等场景
+//
+// 使用示例：
+//
+//	no := uNo.GenYearWeekNo()
+//	// no = "2515"（表示 2025 年第 15 周）
+func GenYearWeekNo() string {
+	now := time.Now()
+	_, isoWeek := now.ISOWeek()
+	return fmt.Sprintf("%s%02d", now.Format("06"), isoWeek)
+}

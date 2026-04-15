@@ -1,6 +1,8 @@
 package uDate
 
 import (
+	"bytes"
+	"fmt"
 	"time"
 )
 
@@ -213,4 +215,92 @@ func DiffDays(t1, t2 time.Time) int {
 		return -days
 	}
 	return days
+}
+
+// AfterDayTime 获取今天 23:59:59 的 time.Time
+//
+// 常用于计算当日剩余时间或设置当日失效的截止时间
+//
+// 使用示例：
+//
+//	deadline := uDate.AfterDayTime()
+//	// deadline = 2024-02-01 23:59:59 +0800 CST
+func AfterDayTime() time.Time {
+	return DayEnd(time.Now())
+}
+
+// AfterMoonTime 获取下个月 1 号 00:00:00 的 time.Time
+//
+// 常用于按月计费、月度统计等场景
+//
+// 使用示例：
+//
+//	t := uDate.AfterMoonTime()
+//	// t = 2024-03-01 00:00:00 +0800 CST
+func AfterMoonTime() time.Time {
+	return MonthStart(time.Now().AddDate(0, 1, 0))
+}
+
+// CurrentDayUnix 获取今天凌晨 00:00:00 的 Unix 时间戳
+//
+// 使用示例：
+//
+//	ts := uDate.CurrentDayUnix()
+//	// ts = 1706745600
+func CurrentDayUnix() int64 {
+	return DayStart(time.Now()).Unix()
+}
+
+// UnixToFormat 将 Unix 时间戳（秒）按指定格式转为字符串
+//
+// 如果 unix 小于 1 或 format 为空，则返回空字符串
+//
+// 使用示例：
+//
+//	s := uDate.UnixToFormat(1706745600, "2006-01-02")
+//	// s = "2024-02-01"
+func UnixToFormat(unix int64, format string) string {
+	if unix < 1 || format == "" {
+		return ""
+	}
+	return Format(UnixToTime(unix), format)
+}
+
+// UnixToDate 将 Unix 时间戳（秒）转为标准日期时间字符串
+//
+// 使用示例：
+//
+//	s := uDate.UnixToDate(1706745600)
+//	// s = "2024-02-01 08:00:00"
+func UnixToDate(unix int64) string {
+	return UnixToFormat(unix, TIME_FORMAT)
+}
+
+// UnixToStringChinese 将秒数转换为中文时长描述
+//
+// 格式为 "X小时Y分钟Z秒"，常用于显示剩余时长或已用时长
+//
+// 使用示例：
+//
+//	s := uDate.UnixToStringChinese(3665)
+//	// s = "1小时1分钟5秒"
+func UnixToStringChinese(duration int64) string {
+	buf := bytes.NewBufferString("")
+	buf.WriteString(fmt.Sprintf("%d小时", duration/3600))
+	duration = duration % 3600
+	buf.WriteString(fmt.Sprintf("%d分钟", duration/60))
+	duration = duration % 60
+	buf.WriteString(fmt.Sprintf("%d秒", duration))
+	return buf.String()
+}
+
+// GetWeekNumberOfYear 计算给定日期是当年的第几周（基于 ISO 8601，周一为每周第一天）
+//
+// 使用示例：
+//
+//	week := uDate.GetWeekNumberOfYear(time.Now())
+//	// week = 5
+func GetWeekNumberOfYear(t time.Time) int {
+	_, isoWeek := t.ISOWeek()
+	return isoWeek
 }
