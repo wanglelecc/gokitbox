@@ -13,7 +13,7 @@ import (
 )
 
 var (
-	configPath     = "../config/consumer.json"
+	configPath     = "../config/worker.json"
 	configPathLock sync.RWMutex
 )
 
