@@ -96,9 +96,10 @@ type DelayConfig struct {
 
 func loadConfigure() *Configure {
 	ctx := context.Background()
+	tag := "worker.loadConfigure"
 
 	configPathLock.Lock()
-	configPath = config.GetConfDefault("App", "consumeConfigPath", configPath)
+	configPath = config.GetConfDefault("App", "workerConfigPath", configPath)
 	if !strings.HasPrefix(configPath, "/") {
 		configPath = config.Binhome() + "/" + configPath
 	}
@@ -107,7 +108,7 @@ func loadConfigure() *Configure {
 
 	b, err := os.ReadFile(cp)
 	if err != nil {
-		logger.Fx(ctx, "consumer", "read config file error", "error", err.Error(), "config_path", cp)
+		logger.Fx(ctx, tag, "read config file error", "error", err.Error(), "config_path", cp)
 		panic(fmt.Sprintf("failed to read consumer config file: %v", err))
 	}
 
@@ -115,7 +116,7 @@ func loadConfigure() *Configure {
 
 	err = json.Unmarshal(b, cfg)
 	if err != nil {
-		logger.Fx(ctx, "consumer", "json Unmarshal error", "error", err.Error())
+		logger.Fx(ctx, tag, "json Unmarshal error", "error", err.Error())
 		panic(fmt.Sprintf("failed to unmarshal consumer config: %v", err))
 	}
 

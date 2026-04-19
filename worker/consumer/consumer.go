@@ -24,6 +24,7 @@ type ConsumeCallback func(TplName string, Key string, Value []byte) bool
 
 func NewConsumeManager(callback ConsumeCallback, alertMgr *AlertManager) *ConsumeManager {
 	ctx := context.Background()
+	tag := "NewConsumerManager"
 
 	var err error
 	manager := new(ConsumeManager)
@@ -33,7 +34,7 @@ func NewConsumeManager(callback ConsumeCallback, alertMgr *AlertManager) *Consum
 	if cfg.Enabled.Kafka {
 		manager.kafka, err = NewKafkaConsumer(cfg.Kafka, callback, alertMgr)
 		if err != nil {
-			logger.Fx(ctx, "NewConsumerManager", "NewKafkaConsumer error", "error", err.Error())
+			logger.Fx(ctx, tag, "NewKafkaConsumer error", "error", err.Error())
 			panic(fmt.Sprintf("failed to initialize kafka consumer: %v", err))
 		}
 	}
@@ -41,7 +42,7 @@ func NewConsumeManager(callback ConsumeCallback, alertMgr *AlertManager) *Consum
 	if cfg.Enabled.Rabbitmq {
 		manager.rabbitmq, err = NewRabbitmqConsumer(cfg.Rabbitmq, callback, alertMgr)
 		if err != nil {
-			logger.Fx(ctx, "NewConsumerManager", "NewRabbitmqConsumer error", "error", err.Error())
+			logger.Fx(ctx, tag, "NewRabbitmqConsumer error", "error", err.Error())
 			panic(fmt.Sprintf("failed to initialize rabbitmq consumer: %v", err))
 		}
 	}
@@ -49,7 +50,7 @@ func NewConsumeManager(callback ConsumeCallback, alertMgr *AlertManager) *Consum
 	if cfg.Enabled.Redis {
 		manager.redis, err = NewRedisConsumer(cfg.Redis, callback, alertMgr)
 		if err != nil {
-			logger.Fx(ctx, "NewConsumerManager", "NewRedisConsumer error", "error", err.Error())
+			logger.Fx(ctx, tag, "NewRedisConsumer error", "error", err.Error())
 			panic(fmt.Sprintf("failed to initialize redis consumer: %v", err))
 		}
 	}
@@ -57,7 +58,7 @@ func NewConsumeManager(callback ConsumeCallback, alertMgr *AlertManager) *Consum
 	if cfg.Enabled.Delay {
 		manager.delay, err = NewDelayConsumer(cfg.Delay, callback, alertMgr)
 		if err != nil {
-			logger.Fx(ctx, "NewConsumerManager", "NewDelayConsumer error", "error", err.Error())
+			logger.Fx(ctx, tag, "NewDelayConsumer error", "error", err.Error())
 			panic(fmt.Sprintf("failed to initialize delay consumer: %v", err))
 		}
 	}
