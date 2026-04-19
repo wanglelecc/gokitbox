@@ -81,7 +81,7 @@ func (log *zapBuilder) LoggerX(ctx context.Context, lvl string, tag string, mess
 		tag = "NoTagError"
 	}
 
-	log.LoggerW(ctx, joinMod, lvl, tag, message, fields...)
+	log.LoggerW(ctx, false, lvl, tag, message, fields...)
 }
 
 func (log *zapBuilder) LoggerF(ctx context.Context, lvl string, tag string, message string, fields ...interface{}) {
@@ -97,7 +97,7 @@ func (log *zapBuilder) LoggerW(ctx context.Context, mod bool, lvl string, tag st
 		tag = "NoTagError"
 	}
 
-	if mod {
+	if mod == false {
 		fields = append([]interface{}{"x_tag", tag}, fields...)
 	} else {
 		// 粘连模式
@@ -126,9 +126,9 @@ func (log *zapBuilder) LoggerW(ctx context.Context, mod bool, lvl string, tag st
 
 func (log *zapBuilder) Sync() error {
 	err := log.zapLogger.Sync()
-	//if log.logWriter != nil {
+	// if log.logWriter != nil {
 	//	log.logWriter.Rotate()
-	//}
+	// }
 
 	return err
 }
