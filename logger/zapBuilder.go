@@ -73,7 +73,7 @@ func (log *zapBuilder) LoadConfig(config *Config) {
 		zap.String("x_department", log.department),
 		zap.String("x_server_ip", log.serverIp),
 		zap.String("x_hostname", log.hostName),
-	), zap.AddCallerSkip(2))
+	), zap.AddCallerSkip(3))
 }
 
 func (log *zapBuilder) LoggerX(ctx context.Context, lvl string, tag string, message string, fields ...interface{}) {
