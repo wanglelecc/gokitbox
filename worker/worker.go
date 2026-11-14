@@ -9,11 +9,10 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/tidwall/gjson"
 	"github.com/wanglelecc/gokitbox/bootstrap"
 	"github.com/wanglelecc/gokitbox/logger"
 	"github.com/wanglelecc/gokitbox/worker/consumer"
-
-	"github.com/tidwall/gjson"
 )
 
 // contextKey 用于 context.WithValue 的专用类型，避免与第三方包的 key 碰撞
@@ -206,13 +205,23 @@ func (w *Worker) RegisterHandle(handles map[string]Handle) bootstrap.BeforeServe
 
 // 初始化 Consumer
 func (w *Worker) InitConsumer() bootstrap.BeforeServerStartFunc {
+	return w.InitConsumerWithConfig(nil)
+}
+
+// InitConsumerWithConfig bypasses the legacy independent configuration loader.
+func (w *Worker) InitConsumerWithConfig(cfg *consumer.Configure) bootstrap.BeforeServerStartFunc {
 	return func() error {
 		var alertMgr *consumer.AlertManager
 		if w.alertFunc != nil {
 			alertMgr = consumer.NewAlertManager(w.alertFunc, w.alertWindow)
 		}
-		w.consumers = consumer.NewConsumeManager(w.deal, alertMgr)
-		return nil
+		if cfg == nil {
+			w.consumers = consumer.NewConsumeManager(w.deal, alertMgr)
+			return nil
+		}
+		var err error
+		w.consumers, err = consumer.NewConsumeManagerWithConfig(cfg, w.deal, alertMgr)
+		return err
 	}
 }
 
@@ -221,7 +230,9 @@ func (w *Worker) CloseConsumer() bootstrap.AfterServerStopFunc {
 	return func() {
 		ctx := context.Background()
 		logger.Wx(ctx, "Exec", "Process Stop...")
-		w.consumers.Close()
+		if w.consumers != nil {
+			w.consumers.Close()
+		}
 		logger.Wx(ctx, "Exec", "Process Stop Complete")
 	}
 }

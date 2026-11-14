@@ -1,5 +1,10 @@
 # producer 消息生产代理
 
+## 显式配置（推荐）
+
+应用调用 Configure(Options{KafkaEnabled, Kafka, BufferLimit, GrayMode})，Kafka 参数类型由 producer/kafka.Options 定义。Configure 校验并复制参数，不创建 broker 连接；首次使用经原有 sync.Once 创建 ProxyManager。NewProxyManagerWithOptions 支持显式创建实例。模块初始化后禁止重配，停止业务后调用 Close 再关闭日志。旧 section 读取保留为兼容路径。
+
+
 消息生产者代理，支持 `kafka`, `redis`, `delay` 等类型。
 
 ## 安装

@@ -4,18 +4,17 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
 
-	"github.com/wanglelecc/gokitbox/config"
+	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
+	"github.com/spf13/cast"
 	"github.com/wanglelecc/gokitbox/logger"
 	"github.com/wanglelecc/gokitbox/producer/common"
 	"github.com/wanglelecc/gokitbox/producer/failmode"
 	"github.com/wanglelecc/gokitbox/producer/meta"
-
-	"github.com/confluentinc/confluent-kafka-go/kafka"
-	"github.com/spf13/cast"
 )
 
 const (
@@ -29,14 +28,22 @@ type CKafka struct {
 	successCount int64
 	errorCount   int64
 
-	cfg      *kafka.ConfigMap
-	producer *kafka.Producer
-	failMode failmode.FailMode
+	cfg           *kafka.ConfigMap
+	producer      *kafka.Producer
+	failMode      failmode.FailMode
+	failurePolicy string
 
 	exit chan struct{}
 }
 
-func CInit(quit chan struct{}, fallBack chan<- []byte) common.MQ {
+// buildProducerConfig is kept separate so tests can verify effective client
+// parameters without connecting to a broker.
+func buildProducerConfig() (*kafka.ConfigMap, error) { return buildConfig(legacyOptions()) }
+
+func buildConfig(o Options) (*kafka.ConfigMap, error) {
+	if err := o.Validate(); err != nil {
+		return nil, err
+	}
 	cfg := &kafka.ConfigMap{
 		"api.version.request":           "true",
 		"message.max.bytes":             1000000,
@@ -55,22 +62,71 @@ func CInit(quit chan struct{}, fallBack chan<- []byte) common.MQ {
 		// 用户不显示配置时，默认值为1。用户根据自己的业务情况进行设置
 		"acks": "1"}
 
+	var setErr error
+	set := func(key string, value interface{}) {
+		if err := cfg.SetKey(key, value); err != nil {
+			setErr = err
+		}
+	}
 	// 设置接入点，请通过控制台获取对应Topic的接入点。
-	cfg.SetKey("bootstrap.servers", strings.Join(config.GetConfArr("KafkaProxy", "brokers"), ","))
+	set("bootstrap.servers", strings.Join(o.Brokers, ","))
 
-	if config.GetConfDefault("KafkaProxy", "sasl", "false") != "true" {
-		cfg.SetKey("security.protocol", "plaintext")
+	if !o.Sasl {
+		set("security.protocol", "plaintext")
 	} else {
-		cfg.SetKey("sasl.mechanism", "PLAIN")
-		cfg.SetKey("security.protocol", "sasl_plaintext")
-		cfg.SetKey("sasl.username", config.GetConf("KafkaProxy", "user"))
-		cfg.SetKey("sasl.password", config.GetConf("KafkaProxy", "password"))
-		// cfg.SetKey("sasl.mechanism", config.GetConf("KafkaProxy", "mechanism"))
+		set("sasl.mechanism", "PLAIN")
+		set("security.protocol", "sasl_plaintext")
+		set("sasl.username", o.Username)
+		set("sasl.password", o.Password)
+		// set("sasl.mechanism", config.GetConf("KafkaProxy", "mechanism"))
 	}
 
+	var waitAll = o.WaitAll
+	if waitAll {
+		set("acks", "all")
+	}
+	compression := o.Compression
+	if compression == "0" {
+		compression = "none"
+	}
+	set("compression.type", compression)
+	partitioner := o.Partitioner
+	if partitioner == "0" {
+		partitioner = "consistent_random"
+	}
+	set("partitioner", partitioner)
+	timeout := o.Timeout.String()
+	duration, err := time.ParseDuration(timeout)
+	if err != nil {
+		if ms, e := strconv.Atoi(timeout); e == nil && ms > 0 {
+			duration = time.Duration(ms) * time.Millisecond
+		} else {
+			return nil, fmt.Errorf("kafka: invalid producer timeout")
+		}
+	}
+	if duration <= 0 || duration.Milliseconds() > 2147483647 {
+		return nil, fmt.Errorf("kafka: producer timeout out of range")
+	}
+	set("message.timeout.ms", int(duration.Milliseconds()))
+	if setErr != nil {
+		return nil, fmt.Errorf("kafka: invalid producer option")
+	}
+	return cfg, nil
+}
+
+func CInit(quit chan struct{}, fallBack chan<- []byte) common.MQ {
+	return InitWithOptions(legacyOptions(), quit, fallBack)
+}
+
+func InitWithOptions(o Options, quit chan struct{}, fallBack chan<- []byte) common.MQ {
+	cfg, err := buildConfig(o)
+	if err != nil {
+		panic(err)
+	}
 	k := new(CKafka)
 	k.cfg = cfg
-	bufferLimit := cast.ToInt(config.GetConfDefault("KafkaProxy", "bufferLimit", "1000"))
+	k.failurePolicy = o.FailMode
+	bufferLimit := o.BufferLimit
 	k.input = make(chan []byte, bufferLimit)
 	k.fallback = fallBack
 	k.exit = make(chan struct{}, 1)
@@ -94,7 +150,7 @@ func (k *CKafka) Close() {
 
 func (k *CKafka) SetFailMode() {
 	var err error
-	k.failMode, err = failmode.GetFailMode(meta.Kafka, config.GetConfDefault("KafkaProxy", "failMode", "discard"))
+	k.failMode, err = failmode.GetFailMode(meta.Kafka, k.failurePolicy)
 	if err != nil {
 		logger.Wx(context.Background(), "SetFailMode", "Kafka SetFailMode error", "error", err.Error())
 		// 默认使用 discard 模式

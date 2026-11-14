@@ -23,47 +23,53 @@ type ConsumeManager struct {
 type ConsumeCallback func(TplName string, Key string, Value []byte) bool
 
 func NewConsumeManager(callback ConsumeCallback, alertMgr *AlertManager) *ConsumeManager {
-	ctx := context.Background()
-	tag := "NewConsumerManager"
+	manager, err := NewConsumeManagerWithConfig(loadConfigure(), callback, alertMgr)
+	if err != nil {
+		panic(err)
+	}
+	return manager
+}
 
+// NewConsumeManagerWithConfig accepts application-owned validated configuration.
+func NewConsumeManagerWithConfig(cfg *Configure, callback ConsumeCallback, alertMgr *AlertManager) (*ConsumeManager, error) {
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
+	manager := &ConsumeManager{cfg: cfg}
 	var err error
-	manager := new(ConsumeManager)
-	cfg := loadConfigure()
-	manager.cfg = cfg
-
+	fail := func(kind string) (*ConsumeManager, error) {
+		manager.Close()
+		return nil, fmt.Errorf("worker: initialize %s consumer failed", kind)
+	}
 	if cfg.Enabled.Kafka {
 		manager.kafka, err = NewKafkaConsumer(cfg.Kafka, callback, alertMgr)
 		if err != nil {
-			logger.Fx(ctx, tag, "NewKafkaConsumer error", "error", err.Error())
-			panic(fmt.Sprintf("failed to initialize kafka consumer: %v", err))
+			return fail("kafka")
 		}
 	}
 
 	if cfg.Enabled.Rabbitmq {
 		manager.rabbitmq, err = NewRabbitmqConsumer(cfg.Rabbitmq, callback, alertMgr)
 		if err != nil {
-			logger.Fx(ctx, tag, "NewRabbitmqConsumer error", "error", err.Error())
-			panic(fmt.Sprintf("failed to initialize rabbitmq consumer: %v", err))
+			return fail("rabbitmq")
 		}
 	}
 
 	if cfg.Enabled.Redis {
 		manager.redis, err = NewRedisConsumer(cfg.Redis, callback, alertMgr)
 		if err != nil {
-			logger.Fx(ctx, tag, "NewRedisConsumer error", "error", err.Error())
-			panic(fmt.Sprintf("failed to initialize redis consumer: %v", err))
+			return fail("redis")
 		}
 	}
 
 	if cfg.Enabled.Delay {
 		manager.delay, err = NewDelayConsumer(cfg.Delay, callback, alertMgr)
 		if err != nil {
-			logger.Fx(ctx, tag, "NewDelayConsumer error", "error", err.Error())
-			panic(fmt.Sprintf("failed to initialize delay consumer: %v", err))
+			return fail("delay")
 		}
 	}
 
-	return manager
+	return manager, nil
 }
 
 // CloseWithTimeout 带超时的优雅关闭

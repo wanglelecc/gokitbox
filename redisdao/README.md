@@ -1,5 +1,10 @@
 # RedisDao Redis 客户端
 
+## 显式配置（推荐）
+
+应用先构造 `Options{Instances: map[string]redis.Options{...}}` 并调用 Configure；参数 map 与 TLSConfig 会复制，保留 PoolSize、MinIdleConns、超时等全部字段。Configure 不创建连接；NewSimpleRedis 首次使用时创建配置好的客户端，不再额外 Ping。每个实例为 standalone；Cluster/Sentinel 需独立 API。初始化后禁止重配，Close 负责关闭。旧 section 读取仅用于未 Configure 的兼容路径。
+
+
 RedisDao 基于 `github.com/redis/go-redis/v9` 封装，提供 Redis 连接池管理和多实例支持。
 
 ## 安装

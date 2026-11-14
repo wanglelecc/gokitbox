@@ -11,7 +11,6 @@ import (
 	"github.com/smallnest/rpcx/client"
 	"github.com/smallnest/rpcx/protocol"
 	"github.com/smallnest/rpcx/share"
-
 	"github.com/wanglelecc/gokitbox/config"
 	"github.com/wanglelecc/gokitbox/logger"
 )
@@ -31,58 +30,67 @@ var (
 	configInitialized  bool          // 配置是否成功初始化
 )
 
-func init() {
-	var initErr error
+// Options are supplied after the application's configuration has been loaded.
+type Options struct {
+	Addrs                                                      []string
+	Username, Password, Bucket, BasePath, Group, AppId, AppKey string
+	CallTimeout, ConnectTimeout                                time.Duration
+}
 
-	// 安全地读取配置
-	defer func() {
-		if r := recover(); r != nil {
-			logger.Ex(context.Background(), "rpcxclient.init", "配置初始化失败", "panic", fmt.Sprintf("%v", r))
-			configInitialized = false
-		}
-	}()
-
-	sAddress = safeGetConfArr("Registry", "addrs")
-
-	// 读取超时配置
-	if callTimeout := config.GetConf("Registry", "rpcCallTimeout"); callTimeout != "" {
-		if d, err := time.ParseDuration(callTimeout); err == nil {
-			rpcxOptCallTimeout = d
-		} else {
-			logger.Wx(context.Background(), "rpcxclient.init", "rpcCallTimeout 解析失败，使用默认值", "error", err.Error())
-			rpcxOptCallTimeout = 30 * time.Second // 默认 30 秒
-		}
-	} else {
-		rpcxOptCallTimeout = 30 * time.Second // 默认 30 秒
+func InitWithOptions(o Options) error {
+	if len(o.Addrs) == 0 || o.BasePath == "" {
+		return errors.New("rpcxclient: registry addresses and basePath are required")
 	}
-
-	rpcxConnectTimeout = time.Second // default 1s
-	if connectTimeout := config.GetConf("Registry", "rpcConnectTimeout"); connectTimeout != "" {
-		if d, err := time.ParseDuration(connectTimeout); err == nil {
-			rpcxConnectTimeout = d
-		} else {
-			logger.Wx(context.Background(), "rpcxclient.init", "rpcConnectTimeout 解析失败，使用默认值", "error", err.Error())
-		}
+	if o.CallTimeout == 0 {
+		o.CallTimeout = 30 * time.Second
 	}
-
-	defaultBasePath = config.GetConf("Registry", "basePath")
-	group = config.GetConf("Registry", "group")
-
-	username = strings.TrimSpace(config.GetConf("Registry", "username"))
-	password = strings.TrimSpace(config.GetConf("Registry", "password"))
-	bucket = strings.TrimSpace(config.GetConf("Registry", "bucket"))
-
-	// 安全读取鉴权配置
-	rpcAuth := safeGetConfStringMap("RpcxAuth")
-	if rpcAuth != nil {
-		appId = rpcAuth["appId"]
-		appKey = rpcAuth["appKey"]
+	if o.ConnectTimeout == 0 {
+		o.ConnectTimeout = time.Second
 	}
-
+	if o.CallTimeout < 0 || o.ConnectTimeout < 0 {
+		return errors.New("rpcxclient: timeouts must be positive")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if configInitialized {
+		return errors.New("rpcxclient: already initialized; recreate clients to change options")
+	}
+	sAddress = append([]string(nil), o.Addrs...)
+	username = o.Username
+	password = o.Password
+	bucket = o.Bucket
+	defaultBasePath = o.BasePath
+	group = o.Group
+	appId = o.AppId
+	appKey = o.AppKey
+	rpcxOptCallTimeout = o.CallTimeout
+	rpcxConnectTimeout = o.ConnectTimeout
 	configInitialized = true
+	return nil
+}
 
-	if initErr != nil {
-		logger.Ex(context.Background(), "rpcxclient.init", "配置初始化出错", "error", initErr.Error())
+// InitFromConfig is a legacy bridge; applications should use InitWithOptions.
+func InitFromConfig() error {
+	callTimeout, err := time.ParseDuration(config.GetConfDefault("Registry", "rpcCallTimeout", "30s"))
+	if err != nil {
+		return errors.New("rpcxclient: invalid rpcCallTimeout")
+	}
+	connectTimeout, err := time.ParseDuration(config.GetConfDefault("Registry", "rpcConnectTimeout", "1s"))
+	if err != nil {
+		return errors.New("rpcxclient: invalid rpcConnectTimeout")
+	}
+	return InitWithOptions(Options{Addrs: config.GetConfArr("Registry", "addrs"), Username: strings.TrimSpace(config.GetConf("Registry", "username")), Password: config.GetConf("Registry", "password"), Bucket: config.GetConf("Registry", "bucket"), BasePath: config.GetConf("Registry", "basePath"), Group: config.GetConf("Registry", "group"), AppId: config.GetConf("RpcxAuth", "appId"), AppKey: config.GetConf("RpcxAuth", "appKey"), CallTimeout: callTimeout, ConnectTimeout: connectTimeout})
+}
+
+var legacyConfigMu sync.Mutex
+
+func ensureConfig() {
+	legacyConfigMu.Lock()
+	defer legacyConfigMu.Unlock()
+	if !IsConfigInitialized() {
+		if err := InitFromConfig(); err != nil {
+			logger.Wx(context.Background(), "rpcxclient.config", "configuration not ready")
+		}
 	}
 }
 
@@ -108,10 +116,13 @@ func safeGetConfStringMap(section string) map[string]string {
 
 // IsConfigInitialized 检查配置是否成功初始化
 func IsConfigInitialized() bool {
+	mu.RLock()
+	defer mu.RUnlock()
 	return configInitialized
 }
 
 func GetSdAddress() []string {
+	ensureConfig()
 	mu.RLock()
 	defer mu.RUnlock()
 	// 返回副本而非引用，防止外部修改
@@ -121,24 +132,28 @@ func GetSdAddress() []string {
 }
 
 func GetUsername() string {
+	ensureConfig()
 	mu.RLock()
 	defer mu.RUnlock()
 	return username
 }
 
 func GetPassword() string {
+	ensureConfig()
 	mu.RLock()
 	defer mu.RUnlock()
 	return password
 }
 
 func GetBucket() string {
+	ensureConfig()
 	mu.RLock()
 	defer mu.RUnlock()
 	return bucket
 }
 
 func GetServiceBasePath() string {
+	ensureConfig()
 	mu.RLock()
 	defer mu.RUnlock()
 	return defaultBasePath
@@ -153,8 +168,10 @@ func GetSelectMode() client.SelectMode {
 }
 
 func GetClientOption() client.Option {
+	ensureConfig()
 	mu.RLock()
 	connectTimeout := rpcxConnectTimeout
+	clientGroup := group
 	mu.RUnlock()
 
 	option := client.Option{
@@ -166,7 +183,7 @@ func GetClientOption() client.Option {
 		BackupLatency:     10 * time.Millisecond,
 		Heartbeat:         true,
 		HeartbeatInterval: 1 * time.Second,
-		Group:             group,
+		Group:             clientGroup,
 	}
 
 	// if failed 5 times, return error immediately, and will try to connect after 10 seconds
@@ -179,14 +196,15 @@ func GetClientOption() client.Option {
 // getClientDiscovery 获取服务发现实例
 // 注意：当前实现每次都创建新的 discovery，不缓存
 func getClientDiscovery(basePath, servicePath string) (discovery client.ServiceDiscovery) {
-	mu.Lock()
-	defer mu.Unlock()
+	ensureConfig()
 
 	ctx := context.Background()
 	tag := "rpcxclient.getClientDiscovery"
 
 	if basePath == "" {
+		mu.RLock()
 		basePath = defaultBasePath
+		mu.RUnlock()
 	}
 
 	defer func() {
@@ -213,6 +231,7 @@ func getClientDiscovery(basePath, servicePath string) (discovery client.ServiceD
 
 // GetAppId 获取 AppId
 func GetAppId() string {
+	ensureConfig()
 	mu.RLock()
 	defer mu.RUnlock()
 	return appId
@@ -220,6 +239,7 @@ func GetAppId() string {
 
 // GetAppKey 获取 AppKey（谨慎使用，仅在需要生成签名时使用）
 func GetAppKey() string {
+	ensureConfig()
 	mu.RLock()
 	defer mu.RUnlock()
 	return appKey
@@ -227,7 +247,7 @@ func GetAppKey() string {
 
 // ValidateConfig 检查客户端配置是否完整
 func ValidateConfig() error {
-	if !configInitialized {
+	if !IsConfigInitialized() {
 		return errors.New("rpcxclient config not initialized")
 	}
 
@@ -247,6 +267,7 @@ func ValidateConfig() error {
 
 // GetCallTimeout 获取调用超时时间
 func GetCallTimeout() time.Duration {
+	ensureConfig()
 	mu.RLock()
 	defer mu.RUnlock()
 	return rpcxOptCallTimeout

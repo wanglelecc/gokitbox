@@ -1,5 +1,10 @@
 # DBDao 数据库访问
 
+## 显式配置（推荐）
+
+应用先构造并 Validate `Options{Driver, Clusters, ShowSql, SlowDuration, MaxOpenConns, MaxIdleConns, ConnMaxLifetime}`，再调用 `Configure`。Configure 深拷贝参数，不创建连接；原有 GetDbInstance 在首次使用时通过 sync.Once 初始化。也可调用 InitWithOptions 直接初始化并接收错误。初始化后禁止重配，关闭使用 CloseAll。显式零值 MaxIdleConns=0 会保留。旧 Init 的 section 读取只用于未 Configure 的兼容调用。
+
+
 DBDao 基于 `go-xorm/xorm` 封装，提供数据库连接池管理和主从分离支持。
 
 ## 安装

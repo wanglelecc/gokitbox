@@ -7,20 +7,19 @@ import (
 	"sync"
 	"time"
 
-	"github.com/wanglelecc/gokitbox/config"
-
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
+	"github.com/wanglelecc/gokitbox/config"
 )
 
 // Config represents all available options for the middleware.
 type Config struct {
-	AllowAllOrigins bool `ini:"allowAllOrigins"`
+	AllowAllOrigins bool `ini:"allowAllOrigins" yaml:"allowAllOrigins"`
 
 	// AllowOrigins is a list of origins a cross-domain request can be executed from.
 	// If the special "*" value is present in the list, all origins will be allowed.
 	// Default value is []
-	AllowOrigins []string `ini:"allowOrigins"`
+	AllowOrigins []string `ini:"allowOrigins" yaml:"allowOrigins"`
 
 	// AllowOriginFunc is a custom function to validate the origin. It take the origin
 	// as argument and returns true if allowed or false otherwise. If this option is
@@ -29,35 +28,35 @@ type Config struct {
 
 	// AllowMethods is a list of methods the client is allowed to use with
 	// cross-domain requests. Default value is simple methods (GET and POST)
-	AllowMethods []string `ini:"allowMethods"`
+	AllowMethods []string `ini:"allowMethods" yaml:"allowMethods"`
 
 	// AllowHeaders is list of non simple headers the client is allowed to use with
 	// cross-domain requests.
-	AllowHeaders []string `ini:"allowHeaders"`
+	AllowHeaders []string `ini:"allowHeaders" yaml:"allowHeaders"`
 
 	// AllowCredentials indicates whether the request can include user credentials like
 	// cookies, HTTP authentication or client side SSL certificates.
-	AllowCredentials bool `ini:"allowCredentials"`
+	AllowCredentials bool `ini:"allowCredentials" yaml:"allowCredentials"`
 
 	// ExposedHeaders indicates which headers are safe to expose to the API of a CORS
 	// API specification
-	ExposeHeaders []string `ini:"exposeHeaders"`
+	ExposeHeaders []string `ini:"exposeHeaders" yaml:"exposeHeaders"`
 
 	// MaxAge indicates how long the results of a preflight request can be cached.
 	// 配置格式同其他超时字段，如 "1h"、"30m"。空值表示不设置（由浏览器决定）。
-	MaxAge string `ini:"maxAge"`
+	MaxAge string `ini:"maxAge" yaml:"maxAge"`
 
 	// Allows to add origins like http://some-domain/*, https://api.* or http://some.*.subdomain.com
-	AllowWildcard bool `ini:"allowWildcard"`
+	AllowWildcard bool `ini:"allowWildcard" yaml:"allowWildcard"`
 
 	// Allows usage of popular browser extensions schemas
-	AllowBrowserExtensions bool `ini:"allowBrowserExtensions"`
+	AllowBrowserExtensions bool `ini:"allowBrowserExtensions" yaml:"allowBrowserExtensions"`
 
 	// Allows usage of WebSocket protocol
-	AllowWebSockets bool `ini:"allowWebSockets"`
+	AllowWebSockets bool `ini:"allowWebSockets" yaml:"allowWebSockets"`
 
 	// Allows usage of file:// schema (dangerous!) use it only when you 100% sure it's needed
-	AllowFiles bool `ini:"allowFiles"`
+	AllowFiles bool `ini:"allowFiles" yaml:"allowFiles"`
 }
 
 // Cors 返回 CORS 中间件，配置在首次请求时从 [HttpCors] 段懒加载，

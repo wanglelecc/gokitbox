@@ -56,34 +56,34 @@ func parseDuration(s string, defaultVal time.Duration) (time.Duration, error) {
 // ServerOptions http server options
 type ServerOptions struct {
 	// Mode run mode 可选 debug/release/test
-	Mode string `ini:"mode"`
+	Mode string `ini:"mode" yaml:"mode"`
 	// Addr TCP address to listen on, ":http" if empty
-	Addr string `ini:"addr"`
+	Addr string `ini:"addr" yaml:"addr"`
 
 	// ReadHeaderTimeout is the maximum duration allowed to read request headers.
 	// 防御 Slowloris 慢速头攻击的关键字段，建议设为 ReadTimeout 的 1/2。
 	// 配置格式支持: "5s", "500ms" 或纯数字（秒）
-	ReadHeaderTimeout string `ini:"readHeaderTimeout"`
+	ReadHeaderTimeout string `ini:"readHeaderTimeout" yaml:"readHeaderTimeout"`
 
 	// ReadTimeout is the maximum duration for reading the entire
 	// request, including the body.
 	// 配置格式支持: "10s", "500ms", "1m" 或纯数字（秒）
-	ReadTimeout string `ini:"readTimeout"`
+	ReadTimeout string `ini:"readTimeout" yaml:"readTimeout"`
 
 	// WriteTimeout is the maximum duration before timing out
 	// writes of the response.
 	// 配置格式支持: "30s", "1m", "500ms" 或纯数字（秒）
-	WriteTimeout string `ini:"writeTimeout"`
+	WriteTimeout string `ini:"writeTimeout" yaml:"writeTimeout"`
 
 	// IdleTimeout is the maximum amount of time to wait for the
 	// next request when keep-alives are enabled.
 	// 连接空闲超过此时长后关闭，keep-alive 处于启用状态。
 	// 配置格式支持: "80s", "1m" 或纯数字（秒）
-	IdleTimeout string `ini:"idleTimeout"`
+	IdleTimeout string `ini:"idleTimeout" yaml:"idleTimeout"`
 
 	// ShutdownTimeout 优雅关闭时等待活跃连接完成的最长时间，超时后强制关闭。
 	// 配置格式支持: "30s", "1m" 或纯数字（秒）
-	ShutdownTimeout string `ini:"shutdownTimeout"`
+	ShutdownTimeout string `ini:"shutdownTimeout" yaml:"shutdownTimeout"`
 }
 
 // GetReadHeaderTimeout 获取解析后的 ReadHeaderTimeout，默认 5s

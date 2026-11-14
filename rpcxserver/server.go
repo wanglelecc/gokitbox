@@ -15,13 +15,12 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/wanglelecc/gokitbox/bootstrap"
-	"github.com/wanglelecc/gokitbox/config"
-	"github.com/wanglelecc/gokitbox/logger"
-
 	"github.com/smallnest/rpcx/protocol"
 	"github.com/smallnest/rpcx/server"
 	"github.com/spf13/cast"
+	"github.com/wanglelecc/gokitbox/bootstrap"
+	"github.com/wanglelecc/gokitbox/config"
+	"github.com/wanglelecc/gokitbox/logger"
 )
 
 // isShutdownError 判断是否为关闭相关的错误
@@ -366,17 +365,20 @@ func (srv *Server) InitRegistry() bootstrap.BeforeServerStartFunc {
 		if err != nil {
 			return err
 		}
-		// 如果不启用注册中心，则不初始化
-		if regOpts.Status != StatusOn {
+		return srv.InitRegistryWithOptions(regOpts)()
+	}
+}
+
+// InitRegistryWithOptions receives application-owned validated registry options.
+func (srv *Server) InitRegistryWithOptions(regOpts RegistryOptions) bootstrap.BeforeServerStartFunc {
+	return func() error {
+		if regOpts.Status == "" || regOpts.Status == StatusOff {
 			return nil
 		}
-
-		if len(regOpts.Addrs) == 0 {
-			return errors.New("can not found registry config")
+		if regOpts.Status != StatusOn || len(regOpts.Addrs) == 0 || regOpts.BasePath == "" || regOpts.UpdateInterval <= 0 {
+			return errors.New("invalid registry options")
 		}
-
 		srv.ConfigureOptions(WithRegistryOptions(regOpts))
-
 		return AddRegistryPlugin(srv)
 	}
 }
@@ -418,11 +420,21 @@ func (srv *Server) validAuthAccess(appId string) (string, bool) {
 
 // InitRpcxAuth 初始化rpcx鉴权
 func (srv *Server) InitRpcxAuth(fns ...ValidAccess) bootstrap.BeforeServerStartFunc {
+	return func() error { return srv.InitRpcxAuthWithOptions(config.GetConfStringMap("ValidRpcxAuth"), fns...)() }
+}
+
+// InitRpcxAuthWithOptions snapshots the caller's authorization map before use.
+func (srv *Server) InitRpcxAuthWithOptions(values map[string]string, fns ...ValidAccess) bootstrap.BeforeServerStartFunc {
+	copied := make(map[string]string, len(values))
+	for key, value := range values {
+		copied[key] = value
+	}
+
 	return func() error {
 		var initErr error
 		srv.authInitialized.Do(func() {
 			srv.authMu.Lock()
-			srv.validAuth = config.GetConfStringMap("ValidRpcxAuth")
+			srv.validAuth = copied
 			srv.server.AuthFunc = func(ctx context.Context, req *protocol.Message, token string) error {
 				return srv.auth(ctx, req, token)
 			}

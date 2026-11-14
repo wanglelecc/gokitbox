@@ -1,7 +1,6 @@
 package redisdao
 
 import (
-	"context"
 	"crypto/tls"
 	"log"
 	"strconv"
@@ -12,27 +11,6 @@ import (
 	"github.com/wanglelecc/gokitbox/config"
 )
 
-func newRedisClient(server string, option redis.Options) *redis.Client {
-	client := redis.NewClient(&redis.Options{
-		Addr:         server,
-		Username:     option.Username, // no username set
-		Password:     option.Password, // no password set
-		DB:           option.DB,       // use default DB
-		PoolSize:     option.PoolSize,
-		ReadTimeout:  option.ReadTimeout,
-		WriteTimeout: option.WriteTimeout,
-		MaxRetries:   option.MaxRetries,
-		TLSConfig:    option.TLSConfig,
-	})
-
-	_, err := client.Ping(context.Background()).Result()
-	if err != nil {
-		log.Printf("get redis connect error: %v, server:%v ", err, server)
-	}
-
-	return client
-}
-
 var initOnce sync.Once
 
 var instance = struct {
@@ -42,12 +20,30 @@ var instance = struct {
 
 func Init() {
 	initOnce.Do(func() {
-		initRedis()
+		optionsMu.Lock()
+		started = true
+		opts := configuredOptions
+		optionsMu.Unlock()
+		if opts == nil {
+			o := legacyOptions()
+			opts = &o
+		}
+		if err := opts.Validate(); err != nil {
+			panic(err)
+		}
+		clients := make(map[string]*redis.Client, len(opts.Instances))
+		for name, option := range opts.Instances {
+			copyOptions := option
+			clients[name] = redis.NewClient(&copyOptions)
+		}
+		instance.Lock()
+		instance.redisInstances = clients
+		instance.Unlock()
 	})
 }
 
-func initRedis() {
-	instance.redisInstances = make(map[string]*redis.Client, 0)
+func legacyOptions() Options {
+	result := Options{Instances: map[string]redis.Options{}}
 
 	confMapList := config.GetConfArrayMap("Redis")
 	for k, v := range confMapList {
@@ -142,9 +138,11 @@ func initRedis() {
 		}
 
 		for _, s := range v {
-			instance.redisInstances[k] = newRedisClient(s, options)
+			options.Addr = s
+			result.Instances[k] = options
 		}
 	}
+	return result
 }
 
 func getInstance(server string) *redis.Client {

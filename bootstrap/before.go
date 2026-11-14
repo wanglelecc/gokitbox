@@ -106,3 +106,21 @@ func InitSnowflake(project string, service string) BeforeServerStartFunc {
 		return nil
 	}
 }
+
+// InitPprofWithOptions is the explicit alternative to the legacy global loader.
+func InitPprofWithOptions(enabled bool, port string) BeforeServerStartFunc {
+	return func() error {
+		if !enabled {
+			return nil
+		}
+		if port == "" {
+			return fmt.Errorf("pprof: port is required")
+		}
+		go func() {
+			if err := http.ListenAndServe(":"+port, nil); err != nil {
+				logger.Ex(context.Background(), "Pprof", "listener stopped", "error", err)
+			}
+		}()
+		return nil
+	}
+}

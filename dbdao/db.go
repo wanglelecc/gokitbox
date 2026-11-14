@@ -1,16 +1,13 @@
 package dbdao
 
 import (
-	"context"
 	"fmt"
 	"sync"
 	"time"
 
-	"github.com/wanglelecc/gokitbox/config"
-	"github.com/wanglelecc/gokitbox/logger"
-
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/spf13/cast"
+	"github.com/wanglelecc/gokitbox/config"
 	"xorm.io/xorm"
 )
 
@@ -22,78 +19,84 @@ type DBDao struct {
 
 var (
 	dbInstance   map[string]*DBDao
-	curDbPoses   map[string]*uint64 // 当前选择的数据库
 	showSql      bool
 	slowDuration time.Duration
-	maxConn      int = 100
-	maxIdle      int = 30
 )
 
-func newDBDaoWithParams(hosts []string, driver string) (Db *DBDao) {
-	Db = new(DBDao)
-	// engine, err := xorm.NewEngine(driver, host)
-	engine, err := xorm.NewEngineGroup(driver, hosts)
-
-	// 必须先检查错误，再赋值给 Db.Engine
-	if err != nil {
-		logger.Pf(context.Background(), "dbdao", "创建数据库引擎失败 (hosts=%v): %v", hosts, err)
-		panic(fmt.Sprintf("创建数据库引擎失败 (hosts=%v): %v", hosts, err))
-	}
-
-	Db.Engine = engine
-	/*
-	  Db.Engine.Logger.SetLevel(core.LOG_DEBUG)
-	  Db.Engine.ShowSQL = true
-	  Db.Engine.ShowInfo = true
-	  Db.Engine.ShowDebug = true
-	  Db.Engine.ShowErr = true
-	  Db.Engine.ShowWarn = true
-	*/
-	Db.Engine.SetMaxOpenConns(maxConn)
-	Db.Engine.SetMaxIdleConns(maxIdle)
-	Db.Engine.SetConnMaxLifetime(time.Second * 3000)
-	Db.Engine.ShowSQL(showSql)
-	Db.Engine.SetLogger(dbLogger)
-	return
-}
-
-func Init() {
+func initialize() error {
 	initOnce.Do(func() {
-		initDb()
+		optionsMu.Lock()
+		started = true
+		opts := configuredOptions
+		optionsMu.Unlock()
+		if opts == nil {
+			o := legacyOptions()
+			opts = &o
+		}
+		initErr = initDbWithOptions(*opts)
 	})
+	return initErr
 }
 
-func initDb() {
-	dbInstance = make(map[string]*DBDao, 0)
-	curDbPoses = make(map[string]*uint64)
-	idc := ""
-	showLog := config.GetConfStringMap("MysqlConfig")
-	showSql = showLog["showSql"] == "true"
-	slowDuration = time.Duration(cast.ToInt(showLog["slowDuration"])) * time.Millisecond
-	maxConnConfig := cast.ToInt(showLog["maxConn"])
-	if maxConnConfig > 0 {
-		maxConn = maxConnConfig
+// InitWithOptions is the explicit initialization API. Configure may instead be
+// called at bootstrap when legacy singleton access should remain lazy.
+func InitWithOptions(o Options) error {
+	if err := Configure(o); err != nil {
+		return err
 	}
+	return initialize()
+}
 
-	maxIdleConfig := cast.ToInt(showLog["maxIdle"])
-	if maxIdleConfig > 0 {
-		maxIdle = maxIdleConfig
+func legacyOptions() Options {
+	values := config.GetConfStringMap("MysqlConfig")
+	o := Options{Driver: "mysql", Clusters: config.GetConfArrayMap("MysqlCluster"), ShowSql: values["showSql"] == "true", SlowDuration: time.Duration(cast.ToInt(values["slowDuration"])) * time.Millisecond, MaxOpenConns: 100, MaxIdleConns: 30, ConnMaxLifetime: 3000 * time.Second}
+	if n := cast.ToInt(values["maxConn"]); n > 0 {
+		o.MaxOpenConns = n
 	}
-
-	if maxIdle > maxConn {
-		maxIdle = maxConn
+	if n := cast.ToInt(values["maxIdle"]); n > 0 {
+		o.MaxIdleConns = n
 	}
+	if o.MaxIdleConns > o.MaxOpenConns {
+		o.MaxIdleConns = o.MaxOpenConns
+	}
+	return o
+}
 
-	for cluster, hosts := range config.GetConfArrayMap("MysqlCluster") {
-		// 过滤IDC
-		if cluster == idc {
-			continue
+func initDbWithOptions(o Options) error {
+	if err := o.Validate(); err != nil {
+		return err
+	}
+	showSql = o.ShowSql
+	slowDuration = o.SlowDuration
+	engines := make(map[string]*DBDao, len(o.Clusters))
+	for name, dsns := range o.Clusters {
+		engine, err := xorm.NewEngineGroup(o.Driver, dsns)
+		if err != nil {
+			for _, db := range engines {
+				db.Close()
+			}
+			return fmt.Errorf("dbdao: cannot create cluster %q", name)
 		}
-
-		instance := cluster
-		dbInstance[instance] = newDBDaoWithParams(hosts, "mysql")
-		curDbPoses[instance] = new(uint64)
+		engine.SetMaxOpenConns(o.MaxOpenConns)
+		engine.SetMaxIdleConns(o.MaxIdleConns)
+		engine.SetConnMaxLifetime(o.ConnMaxLifetime)
+		engine.ShowSQL(o.ShowSql)
+		engine.SetLogger(dbLogger)
+		engines[name] = &DBDao{Engine: engine}
 	}
+	dbInstance = engines
+	return nil
+}
+
+// CloseAll closes all engines initialized by this module.
+func CloseAll() error {
+	var first error
+	for _, db := range dbInstance {
+		if err := db.Close(); err != nil && first == nil {
+			first = err
+		}
+	}
+	return first
 }
 
 func GetDbInstance(db string) *DBDao {
@@ -112,4 +115,10 @@ func GetDbInstance(db string) *DBDao {
 
 func (this *DBDao) Close() error {
 	return this.Engine.Close()
+}
+
+func Init() {
+	if err := initialize(); err != nil {
+		panic(err)
+	}
 }

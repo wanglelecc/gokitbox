@@ -10,10 +10,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/wanglelecc/gokitbox/logger"
-
-	"github.com/confluentinc/confluent-kafka-go/kafka"
+	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
 	"github.com/spf13/cast"
+	"github.com/wanglelecc/gokitbox/logger"
 )
 
 const (

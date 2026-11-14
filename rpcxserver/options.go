@@ -17,25 +17,25 @@ const (
 
 // RegistryOptions 服务注册中心配置
 type RegistryOptions struct {
-	Status         string        `ini:"status"`
-	Addrs          []string      `ini:"addrs"`
-	BasePath       string        `ini:"basePath"`
-	UpdateInterval time.Duration `ini:"updateInterval"`
-	UserName       string        `ini:"username"`
-	Password       string        `ini:"password"`
-	Bucket         string        `ini:"bucket"`
-	Group          string        `ini:"group"`
+	Status         string        `ini:"status" yaml:"status"`
+	Addrs          []string      `ini:"addrs" yaml:"addrs"`
+	BasePath       string        `ini:"basePath" yaml:"basePath"`
+	UpdateInterval time.Duration `ini:"updateInterval" yaml:"updateInterval"`
+	UserName       string        `ini:"username" yaml:"username"`
+	Password       string        `ini:"password" yaml:"password"`
+	Bucket         string        `ini:"bucket" yaml:"bucket"`
+	Group          string        `ini:"group" yaml:"group"`
 }
 
 type OptionFunc func(*Options)
 
 // Options server options
 type Options struct {
-	Network      string        `ini:"network"`
-	Addr         string        `ini:"addr"`
-	Port         string        `ini:"port"`
-	WriteTimeout time.Duration `ini:"writeTimeout"`
-	ReadTimeout  time.Duration `ini:"readTimeout"`
+	Network      string        `ini:"network" yaml:"network"`
+	Addr         string        `ini:"addr" yaml:"addr"`
+	Port         string        `ini:"port" yaml:"port"`
+	WriteTimeout time.Duration `ini:"writeTimeout" yaml:"writeTimeout"`
+	ReadTimeout  time.Duration `ini:"readTimeout" yaml:"readTimeout"`
 	RegistryOpts RegistryOptions
 }
 

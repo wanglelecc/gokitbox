@@ -3,7 +3,6 @@ package config
 import (
 	"errors"
 	"log"
-	"os"
 	"os/user"
 	"path/filepath"
 	"strings"
@@ -32,14 +31,6 @@ type Config interface {
 }
 
 var (
-	// global cache
-	// only load the config file once
-	// after config init complete,all config data get from cache
-	configCache = struct {
-		sync.RWMutex
-		cache map[string]Config
-	}{cache: make(map[string]Config, 0)}
-
 	// when you don't want to use ini or yaml file source,you need the "any" pattern
 	// the "any" pattern can customize the data source by register a plugin
 	anyFileMap = make(map[string]func() (Config, error), 0)
@@ -109,24 +100,6 @@ func Binhome() string {
 	}
 }
 
-// get current path
-func pwd() string {
-	if path, err := os.Getwd(); err == nil {
-		return path
-	}
-
-	return ""
-}
-
-// get app runtime path
-func getAppDir() string {
-	if path, err := osext.Executable(); err == nil {
-		return filepath.Dir(path)
-	}
-
-	return ""
-}
-
 func SetConfPathPrefix(fullPathPrefix string) {
 	if len(fullPathPrefix) != 0 {
 		USER_CONF_PATH = fullPathPrefix
@@ -150,93 +123,24 @@ func Set(section, key string, value interface{}) {
 	cfg.Set(section, key, value)
 }
 
-func Load(path string) (cfg Config, err error) {
-	// load any module
-	// path is not a valid path
-	if !strings.Contains(path, "/") {
-		fn := anyFileMap[path]
-		if fn == nil {
-			err = errors.New("unknown config source: " + path)
-			return
-		}
-		cfg, err = fn()
-		return
+// Load uses the explicit filesystem path (relative to the current working
+// directory). Registered sources are selected only by an exact registered name.
+// File loads are fresh; process-wide caching is provided by InitConfig only.
+func Load(path string) (Config, error) {
+	if fn := anyFileMap[path]; fn != nil {
+		return fn()
 	}
-
-	if len(path) < 2 {
-		return nil, errors.New("path invalid")
-	}
-
-	// 用 filepath.Ext 检测文件类型，支持 .yaml / .yml / .ini
-	fileType := "ini"
 	switch strings.ToLower(filepath.Ext(path)) {
 	case ".yaml", ".yml":
-		fileType = "yaml"
+		return loadYamlFile(path)
 	case ".ini":
-		// 已是 ini，无需处理
+		return loadIniFile(path)
 	default:
-		// 无扩展名或未知扩展名，补 .ini 后缀
-		path = path + ".ini"
+		return nil, errors.New("unknown config source or unsupported file extension: " + path)
 	}
-	// config cache
-	var ok bool
-	configCache.RLock()
-	// read cache first
-	cfg, ok = configCache.cache[path]
-	configCache.RUnlock()
-	// no cache
-	if !ok {
-		oPath := path
-
-		// path invalid,path completed
-		if !strings.HasPrefix(path, "/") {
-			pathsToTry := []string{
-				// Binhome() + "/" + oPath,
-				// home() + "/" + oPath,
-				getAppDir() + "/" + filepath.Base(oPath),
-				getAppDir() + "/" + oPath,
-				filepath.Dir(getAppDir()) + "/" + oPath,
-				pwd() + "/" + oPath,
-			}
-
-			for _, potentialPath := range pathsToTry {
-				if _, err := os.Stat(potentialPath); err == nil {
-					path = potentialPath
-					break
-				}
-			}
-		}
-
-		// load file and create cache
-		configCache.Lock()
-		// double-check：升级为写锁期间可能已被其他 goroutine 加载
-		if cached, exists := configCache.cache[path]; exists {
-			configCache.Unlock()
-			cfg = cached
-			return
-		}
-		if fileType == "yaml" {
-			if cfg, err = loadYamlFile(path); err == nil {
-				configCache.cache[path] = cfg
-				log.Printf("load configuration file path: %s", strings.Replace(path, "/./", "/", -1))
-			}
-		} else {
-			if cfg, err = loadIniFile(path); err == nil {
-				configCache.cache[path] = cfg
-				log.Printf("load configuration file path: %s", strings.Replace(path, "/./", "/", -1))
-			}
-		}
-
-		configCache.Unlock()
-	}
-	return
 }
 
 func ClearConfigCache() {
-	configCache.Lock()
-	configCache.cache = make(map[string]Config, 0)
-	configCache.Unlock()
-
 	gCfgMu.Lock()
 	gCfg = nil
 	gCfgMu.Unlock()
@@ -257,7 +161,7 @@ func GetConfDefault(sec, key, def string) string {
 	cfg := globalCfg()
 	if cfg == nil {
 		log.Printf("config error: NOT_FOUND[sec:%s,key:%s]", sec, key)
-		return ""
+		return def
 	}
 	return cfg.MustValue(sec, key, def)
 }

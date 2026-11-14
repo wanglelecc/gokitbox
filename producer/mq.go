@@ -13,15 +13,14 @@ import (
 	"time"
 
 	"github.com/redis/go-redis/v9"
+	"github.com/spf13/cast"
+	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 	"github.com/wanglelecc/gokitbox/config"
 	"github.com/wanglelecc/gokitbox/logger"
 	"github.com/wanglelecc/gokitbox/producer/common"
 	"github.com/wanglelecc/gokitbox/producer/kafka"
 	"github.com/wanglelecc/gokitbox/producer/meta"
-
-	"github.com/spf13/cast"
-	"github.com/tidwall/gjson"
-	"github.com/tidwall/sjson"
 )
 
 type InitP func(exit chan struct{}, fallBack chan<- []byte) common.MQ
@@ -52,12 +51,23 @@ func Init() {
 
 func initProducer() {
 	// 初始化 Kafka
-	kafkaEnable := cast.ToBool(config.GetConfDefault("KafkaProxy", "enable", "false"))
-	if kafkaEnable {
-		AddMQ(meta.Kafka, kafka.CInit)
+	optionsMu.Lock()
+	started = true
+	configured := configuredOptions
+	optionsMu.Unlock()
+	var opts Options
+	if configured != nil {
+		opts = *configured
+	} else {
+		opts = legacyOptions()
+	}
+	if opts.KafkaEnabled {
+		AddMQ(meta.Kafka, func(exit chan struct{}, fallback chan<- []byte) common.MQ {
+			return kafka.InitWithOptions(opts.Kafka, exit, fallback)
+		})
 	}
 
-	std = NewProxyManager()
+	std = NewProxyManagerWithOptions(opts)
 }
 
 type ProxyManager struct {
@@ -71,10 +81,12 @@ type ProxyManager struct {
 	grayMode bool
 }
 
-func NewProxyManager() *ProxyManager {
+func NewProxyManager() *ProxyManager { return NewProxyManagerWithOptions(currentOptions()) }
+
+func NewProxyManagerWithOptions(o Options) *ProxyManager {
 	pm := new(ProxyManager)
-	bufferLimit := cast.ToInt64(config.GetConfDefault("Producer", "bufferLimit", "2000"))
-	pm.grayMode = cast.ToBool(config.GetConfDefault("MQProxy", "grayMode", "false"))
+	bufferLimit := o.BufferLimit
+	pm.grayMode = o.GrayMode
 
 	pm.exit = make(chan string, 1)
 	pm.done = make(chan struct{})
@@ -225,4 +237,8 @@ func appendTraceId(ctx context.Context, body []byte) []byte {
 	}
 
 	return nBody
+}
+
+func legacyOptions() Options {
+	return Options{KafkaEnabled: cast.ToBool(config.GetConfDefault("KafkaProxy", "enable", "false")), Kafka: kafka.LegacyOptions(), BufferLimit: cast.ToInt(config.GetConfDefault("Producer", "bufferLimit", "2000")), GrayMode: cast.ToBool(config.GetConfDefault("MQProxy", "grayMode", "false"))}
 }

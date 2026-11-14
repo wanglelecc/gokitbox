@@ -1,149 +1,162 @@
 package config
 
 import (
-	"log"
-	"os"
+	"errors"
+	"fmt"
+	"reflect"
+	"sort"
 	"strings"
+	"sync"
 
+	"github.com/goccy/go-yaml"
 	"github.com/spf13/cast"
-	yaml "gopkg.in/yaml.v2"
 )
 
-//yaml struct
-//support yaml file parse
-//implemented Config interface
+// YamlFile is the legacy section/key compatibility view. Access is synchronized;
+// new application code should use Document.Decode and explicit module Options.
 type YamlFile struct {
-	data map[string]interface{} // Section -> key : value
+	mu   sync.RWMutex
+	data map[string]interface{}
 }
 
-//set function
-//need clear cache after set value
-func (this *YamlFile) Set(section, key string, value interface{}) {
-	smap := make(map[interface{}]interface{}, 0)
-	smap[key] = value
-	this.data[section] = smap
-}
-
-//load yaml file
-func loadYamlFile(path string) (cfg Config, err error) {
-	//read file
-	content, ioerr := os.ReadFile(path)
-	if ioerr != nil {
-		err = ioerr
-		log.Printf("loadYamlFile error: %v", ioerr)
-		return nil, err
-	}
-	data := make(map[string]interface{}, 0)
-	//convert bytes to map
-	err = yaml.Unmarshal(content, &data)
+func loadYamlFile(path string) (Config, error) {
+	doc, err := ReadYAML(path)
 	if err != nil {
-		log.Printf("loadYamlFile error: %v", err)
 		return nil, err
 	}
-	yamlFile := new(YamlFile)
-	yamlFile.data = data
-	return yamlFile, nil
+	return parseYaml(doc.data)
 }
 
-//MustValue function implemented
-func (this *YamlFile) MustValue(section, key string, defaultVal ...string) string {
-	defaultValue := ""
-	if len(defaultVal) > 0 {
-		defaultValue = defaultVal[0]
+func parseYaml(content []byte) (*YamlFile, error) {
+	var data map[string]interface{}
+	if err := DecodeYAML(content, &data); err != nil {
+		return nil, err
 	}
+	return &YamlFile{data: data}, nil
+}
 
-	if val, ok := this.data[section]; !ok {
-		return defaultValue
-	} else {
-		//match the key
-		if data, ok := val.(map[interface{}]interface{}); ok {
-			for k, v := range data {
-				if cast.ToString(k) == key {
-					return cast.ToString(v)
-				}
-			}
-		} else {
-			return defaultValue
+func (f *YamlFile) Set(section, key string, value interface{}) {
+	// Copy input so callers cannot mutate the view through slices/maps.
+	b, err := yaml.Marshal(map[string]interface{}{key: value})
+	if err != nil {
+		return
+	}
+	var copied map[string]interface{}
+	if err := yaml.Unmarshal(b, &copied); err != nil {
+		return
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	sectionData, ok := f.data[section].(map[string]interface{})
+	if !ok {
+		sectionData = make(map[string]interface{})
+		f.data[section] = sectionData
+	}
+	sectionData[key] = copied[key]
+}
+
+func (f *YamlFile) MustValue(section, key string, defaults ...string) string {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	if values, ok := f.data[section].(map[string]interface{}); ok {
+		if val, exists := values[key]; exists && val != nil {
+			return cast.ToString(val)
 		}
 	}
-	return defaultValue
+	if len(defaults) > 0 {
+		return defaults[0]
+	}
+	return ""
 }
 
-//MustValueArray implemented
-//split value by delim,like ",","-"
-func (this *YamlFile) MustValueArray(section, key, delim string) []string {
-	val := this.MustValue(section, key, "")
-	if val != "" {
-		return strings.Split(val, delim)
+func (f *YamlFile) MustValueArray(section, key, delim string) []string {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	values, ok := f.data[section].(map[string]interface{})
+	if !ok {
+		return nil
+	}
+	switch value := values[key].(type) {
+	case []interface{}:
+		result := make([]string, len(value))
+		for i, v := range value {
+			result[i] = cast.ToString(v)
+		}
+		return result
+	case string:
+		if value == "" {
+			return nil
+		}
+		if delim == " " {
+			return strings.Fields(value)
+		}
+		return strings.Split(value, delim)
 	}
 	return nil
 }
 
-//GetKeyList implemented
-//get all keys
-func (this *YamlFile) GetKeyList(section string) []string {
-	if val, err := this.GetSection(section); err != nil {
+func (f *YamlFile) GetKeyList(section string) []string {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	values, ok := f.data[section].(map[string]interface{})
+	if !ok {
 		return nil
-	} else {
-		data := make([]string, 0, len(val))
-		for k := range val {
-			data = append(data, k)
-		}
-		return data
 	}
+	keys := make([]string, 0, len(values))
+	for k := range values {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
-//empty function
-func (this *YamlFile) GetSectionList() []string {
-	return nil
+func (f *YamlFile) GetSectionList() []string {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	keys := make([]string, 0, len(f.data))
+	for k := range f.data {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
-//GetSection implemented
-func (this *YamlFile) GetSection(section string) (map[string]string, error) {
-	if val, ok := this.data[section]; !ok {
-		return nil, nil
-	} else {
-		//math the type
-		if data, ok := val.(map[interface{}]interface{}); ok {
-			ret := make(map[string]string, len(data))
-			//format map key and value
-			for k, v := range data {
-				ret[cast.ToString(k)] = cast.ToString(v)
-			}
-			return ret, nil
+func (f *YamlFile) GetSection(section string) (map[string]string, error) {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	values, ok := f.data[section].(map[string]interface{})
+	if !ok {
+		return nil, fmt.Errorf("config: section %q is missing or not a mapping", section)
+	}
+	result := make(map[string]string, len(values))
+	for k, v := range values {
+		result[k] = cast.ToString(v)
+	}
+	return result, nil
+}
+
+func (f *YamlFile) GetSectionObject(section string, out interface{}) error {
+	if reflect.ValueOf(out).Kind() != reflect.Ptr || reflect.ValueOf(out).IsNil() {
+		return errors.New("config: destination must be a non-nil pointer")
+	}
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	var value interface{} = f.data
+	if section != "" {
+		var exists bool
+		value, exists = f.data[section]
+		if !exists || value == nil {
+			return fmt.Errorf("config: section %q is missing", section)
 		}
 	}
-	return nil, nil
-}
-
-//GetSectionObject implemented
-//object must be a pointer
-func (this *YamlFile) GetSectionObject(section string, obj interface{}) error {
-	//no section,use all data
-	if section == "" {
-		//formate map to bytes
-		byt, err := yaml.Marshal(this.data)
-		if err != nil {
-			return err
-		}
-		//format bytes to object
-		err = yaml.Unmarshal(byt, obj)
-		if err != nil {
-			return err
-		}
-	} else if val, ok := this.data[section]; !ok {
-		//not hit value
-		return nil
-	} else {
-		//convert value to object by section
-		byt, err := yaml.Marshal(val)
-		if err != nil {
-			return err
-		}
-		err = yaml.Unmarshal(byt, obj)
-		if err != nil {
-			return err
-		}
+	b, err := yaml.Marshal(value)
+	if err != nil {
+		return errors.New("config: cannot encode section")
+	}
+	// Legacy consumers may intentionally project only part of a section. Strict
+	// application schemas use Document.Decode; keep projection compatibility here.
+	if err := yaml.Unmarshal(b, out); err != nil {
+		return decodeError(err)
 	}
 	return nil
 }

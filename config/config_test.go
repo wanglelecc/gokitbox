@@ -113,18 +113,18 @@ func TestGetConfArr(t *testing.T) {
 
 func TestGetConfStringMap(t *testing.T) {
 	tests := []struct {
-		name         string
-		section      string
-		expectedKey  string
-		expectedVal  string
-		shouldExist  bool
+		name        string
+		section     string
+		expectedKey string
+		expectedVal string
+		shouldExist bool
 	}{
 		{
-			name:         "获取 StringMap",
-			section:      "goyamlStringMap",
-			expectedKey:  "name",
-			expectedVal:  "goyaml",
-			shouldExist:  true,
+			name:        "获取 StringMap",
+			section:     "goyamlStringMap",
+			expectedKey: "name",
+			expectedVal: "goyaml",
+			shouldExist: true,
 		},
 	}
 
@@ -168,9 +168,9 @@ func TestGetConfArrayMap(t *testing.T) {
 func TestConfMapToStruct(t *testing.T) {
 	// 简化测试，只验证不报错
 	tests := []struct {
-		name      string
-		section   string
-		wantErr   bool
+		name    string
+		section string
+		wantErr bool
 	}{
 		{
 			name:    "映射到结构体",

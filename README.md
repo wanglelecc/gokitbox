@@ -257,7 +257,7 @@ gokitbox/
 
 ## 依赖要求
 
-- Go 1.25+
+- Go 1.26.10+
 - MySQL 5.7+（dbdao）
 - Redis 5.0+（redisdao, uSnowflake）
 - Kafka 2.0+（producer, worker）
