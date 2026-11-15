@@ -270,3 +270,7 @@ MIT License
 ## 作者
 
 wanglelecc
+
+## gRPC 基础封装
+
+[grpcserver](grpcserver/README.md) 提供显式配置、注册、TLS/mTLS、拦截器与生命周期；[grpcclient](grpcclient/README.md) 提供 target、凭证、metadata、deadline 与连接所有权。与 RPCX 并存，应用按需选择。
