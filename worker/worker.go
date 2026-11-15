@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime/debug"
+	"sync"
 	"syscall"
 	"time"
 
@@ -23,6 +24,9 @@ type Worker struct {
 	afterFuncs  []bootstrap.AfterServerStopFunc
 	exit        chan os.Signal
 
+	runDone   chan struct{}
+	runOnce   sync.Once
+	stopOnce  sync.Once
 	consumers *consumer.ConsumeManager
 
 	// 超时配置
@@ -240,4 +244,41 @@ func (w *Worker) CloseConsumer() bootstrap.AfterServerStopFunc {
 // 设置消费者配置文件路径
 func SetConfigPath(path string) {
 	consumer.SetConfigPath(path)
+}
+
+// Start/Wait/Stop expose a signal-free lifecycle to the composition root.
+func (w *Worker) Start(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	started := false
+	w.runOnce.Do(func() { started = true; w.runDone = make(chan struct{}) })
+	if !started {
+		return fmt.Errorf("worker: already started")
+	}
+	for _, fn := range w.beforeFuncs {
+		if err := fn(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+func (w *Worker) Wait() error {
+	if w.runDone == nil {
+		return fmt.Errorf("worker: not started")
+	}
+	<-w.runDone
+	return nil
+}
+func (w *Worker) Stop(ctx context.Context) error {
+	if w.runDone == nil {
+		return nil
+	}
+	defer w.stopOnce.Do(func() { close(w.runDone) })
+	if w.consumers != nil {
+		if err := w.consumers.CloseContext(ctx); err != nil {
+			return err
+		}
+	}
+	return nil
 }

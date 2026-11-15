@@ -77,18 +77,18 @@ idleTimeout = 60s
 
 ```go
     import (
-            "github.com/wanglelecc/gokitbox/config"
+            "github.com/wanglelecc/gokitbox/configsource"
             "github.com/wanglelecc/gokitbox/httpserver"
             "github.com/wanglelecc/gokitbox/bootstrap"
             "github.com/wanglelecc/gokitbox/httpserver/middleware"
         )
 
     // 先初始化配置
-    config.Init()
+    configsource.Init()
     
     // 从配置文件加载 ServerOptions
     var opts httpserver.ServerOptions
-    err := config.ConfMapToStruct("HttpServer", &opts)
+    err := configsource.ConfMapToStruct("HttpServer", &opts)
     if err != nil {
         // 使用默认配置
         opts = httpserver.DefaultOptions()

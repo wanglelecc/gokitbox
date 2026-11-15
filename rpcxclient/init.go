@@ -11,7 +11,7 @@ import (
 	"github.com/smallnest/rpcx/client"
 	"github.com/smallnest/rpcx/protocol"
 	"github.com/smallnest/rpcx/share"
-	"github.com/wanglelecc/gokitbox/config"
+	"github.com/wanglelecc/gokitbox/configsource"
 	"github.com/wanglelecc/gokitbox/logger"
 )
 
@@ -71,15 +71,15 @@ func InitWithOptions(o Options) error {
 
 // InitFromConfig is a legacy bridge; applications should use InitWithOptions.
 func InitFromConfig() error {
-	callTimeout, err := time.ParseDuration(config.GetConfDefault("Registry", "rpcCallTimeout", "30s"))
+	callTimeout, err := time.ParseDuration(configsource.GetConfDefault("Registry", "rpcCallTimeout", "30s"))
 	if err != nil {
 		return errors.New("rpcxclient: invalid rpcCallTimeout")
 	}
-	connectTimeout, err := time.ParseDuration(config.GetConfDefault("Registry", "rpcConnectTimeout", "1s"))
+	connectTimeout, err := time.ParseDuration(configsource.GetConfDefault("Registry", "rpcConnectTimeout", "1s"))
 	if err != nil {
 		return errors.New("rpcxclient: invalid rpcConnectTimeout")
 	}
-	return InitWithOptions(Options{Addrs: config.GetConfArr("Registry", "addrs"), Username: strings.TrimSpace(config.GetConf("Registry", "username")), Password: config.GetConf("Registry", "password"), Bucket: config.GetConf("Registry", "bucket"), BasePath: config.GetConf("Registry", "basePath"), Group: config.GetConf("Registry", "group"), AppId: config.GetConf("RpcxAuth", "appId"), AppKey: config.GetConf("RpcxAuth", "appKey"), CallTimeout: callTimeout, ConnectTimeout: connectTimeout})
+	return InitWithOptions(Options{Addrs: configsource.GetConfArr("Registry", "addrs"), Username: strings.TrimSpace(configsource.GetConf("Registry", "username")), Password: configsource.GetConf("Registry", "password"), Bucket: configsource.GetConf("Registry", "bucket"), BasePath: configsource.GetConf("Registry", "basePath"), Group: configsource.GetConf("Registry", "group"), AppId: configsource.GetConf("RpcxAuth", "appId"), AppKey: configsource.GetConf("RpcxAuth", "appKey"), CallTimeout: callTimeout, ConnectTimeout: connectTimeout})
 }
 
 var legacyConfigMu sync.Mutex
@@ -101,7 +101,7 @@ func safeGetConfArr(section, key string) []string {
 			logger.Wx(context.Background(), "rpcxclient.safeGetConfArr", "获取配置失败", "section", section, "key", key, "panic", fmt.Sprintf("%v", r))
 		}
 	}()
-	return config.GetConfArr(section, key)
+	return configsource.GetConfArr(section, key)
 }
 
 // safeGetConfStringMap 安全地获取配置 map
@@ -111,7 +111,7 @@ func safeGetConfStringMap(section string) map[string]string {
 			logger.Wx(context.Background(), "rpcxclient.safeGetConfStringMap", "获取配置失败", "section", section, "panic", fmt.Sprintf("%v", r))
 		}
 	}()
-	return config.GetConfStringMap(section)
+	return configsource.GetConfStringMap(section)
 }
 
 // IsConfigInitialized 检查配置是否成功初始化

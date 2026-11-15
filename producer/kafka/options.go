@@ -5,7 +5,7 @@ import (
 	"time"
 
 	"github.com/spf13/cast"
-	"github.com/wanglelecc/gokitbox/config"
+	"github.com/wanglelecc/gokitbox/configsource"
 )
 
 type Options struct {
@@ -51,27 +51,27 @@ func (o Options) Validate() error {
 }
 func legacyOptions() Options {
 	o := DefaultOptions()
-	o.Brokers = config.GetConfArr("KafkaProxy", "brokers")
-	o.Sasl = config.GetConf("KafkaProxy", "sasl") == "true"
-	o.Username = config.GetConf("KafkaProxy", "user")
-	o.Password = config.GetConf("KafkaProxy", "password")
-	o.WaitAll = config.GetConf("KafkaProxy", "KafkaWaitAll") == "true"
-	o.Compression = config.GetConfDefault("KafkaProxy", "KafkaCompression", "none")
+	o.Brokers = configsource.GetConfArr("KafkaProxy", "brokers")
+	o.Sasl = configsource.GetConf("KafkaProxy", "sasl") == "true"
+	o.Username = configsource.GetConf("KafkaProxy", "user")
+	o.Password = configsource.GetConf("KafkaProxy", "password")
+	o.WaitAll = configsource.GetConf("KafkaProxy", "KafkaWaitAll") == "true"
+	o.Compression = configsource.GetConfDefault("KafkaProxy", "KafkaCompression", "none")
 	if o.Compression == "0" {
 		o.Compression = "none"
 	}
-	o.Partitioner = config.GetConfDefault("KafkaProxy", "KafkaPartitioner", "consistent_random")
+	o.Partitioner = configsource.GetConfDefault("KafkaProxy", "KafkaPartitioner", "consistent_random")
 	if o.Partitioner == "0" {
 		o.Partitioner = "consistent_random"
 	}
-	value := config.GetConfDefault("KafkaProxy", "KafkaProducerTimeout", "30s")
+	value := configsource.GetConfDefault("KafkaProxy", "KafkaProducerTimeout", "30s")
 	if d, err := time.ParseDuration(value); err == nil {
 		o.Timeout = d
 	} else {
 		o.Timeout = time.Duration(cast.ToInt(value)) * time.Millisecond
 	}
-	o.BufferLimit = cast.ToInt(config.GetConfDefault("KafkaProxy", "bufferLimit", "1000"))
-	o.FailMode = config.GetConfDefault("KafkaProxy", "failMode", "discard")
+	o.BufferLimit = cast.ToInt(configsource.GetConfDefault("KafkaProxy", "bufferLimit", "1000"))
+	o.FailMode = configsource.GetConfDefault("KafkaProxy", "failMode", "discard")
 	return o
 }
 

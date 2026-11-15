@@ -48,13 +48,13 @@ package main
 import (
     "context"
     
-    "github.com/wanglelecc/gokitbox/config"
+    "github.com/wanglelecc/gokitbox/configsource"
     "github.com/wanglelecc/gokitbox/logger"
 )
 
 func main() {
     // 方法1：通过配置文件初始化
-    cfgMap := config.GetConfStringMap("Log")
+    cfgMap := configsource.GetConfStringMap("Log")
     logConfig := logger.NewConfig().SetConfigMap(cfgMap)
     
     // 设置基础信息

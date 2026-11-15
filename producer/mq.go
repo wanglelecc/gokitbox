@@ -16,7 +16,7 @@ import (
 	"github.com/spf13/cast"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
-	"github.com/wanglelecc/gokitbox/config"
+	"github.com/wanglelecc/gokitbox/configsource"
 	"github.com/wanglelecc/gokitbox/logger"
 	"github.com/wanglelecc/gokitbox/producer/common"
 	"github.com/wanglelecc/gokitbox/producer/kafka"
@@ -78,7 +78,8 @@ type ProxyManager struct {
 	exit  chan string
 	done  chan struct{} // 通知 Close 调用方 Run goroutine 已退出
 
-	grayMode bool
+	closeOnce sync.Once
+	grayMode  bool
 }
 
 func NewProxyManager() *ProxyManager { return NewProxyManagerWithOptions(currentOptions()) }
@@ -185,34 +186,54 @@ func (m *ProxyManager) Run() {
 			}
 			mq := m.mqMap[mqType] // 判断消息类型，并将其发送到对应的mq
 			if mq != nil {
-				mq.Input() <- msg
+				select {
+				case mq.Input() <- msg:
+				case <-m.exit:
+					m.shutdown()
+					return
+				}
 			} else {
 				logger.Ex(context.Background(), "ProxyManager", fmt.Sprintf("not support mq type%s", string(mqType)))
 			}
 		case <-m.exit:
-
-			for _, mq := range m.mqMap {
-				mq.Close()
-			}
-
-			for _, quit := range m.quits {
-				<-quit
-			}
-
-			close(m.done)
+			m.shutdown()
 			return
 		}
 	}
 }
 
-func (m *ProxyManager) Close() {
-	m.exit <- "shutdown"
-	<-m.done // 等待 Run goroutine 完成所有 MQ Flush 后再返回
+func (m *ProxyManager) shutdown() {
+	for _, mq := range m.mqMap {
+		mq.Close()
+	}
+	for _, quit := range m.quits {
+		<-quit
+	}
+	close(m.done)
 }
-
+func (m *ProxyManager) CloseContext(ctx context.Context) error {
+	m.closeOnce.Do(func() { m.exit <- "shutdown" })
+	select {
+	case <-m.done:
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("producer shutdown incomplete: %w", ctx.Err())
+	}
+}
+func (m *ProxyManager) Close() {
+	if err := m.CloseContext(context.Background()); err != nil {
+		logger.Ex(context.Background(), "producer.Close", "close failed", "error", err)
+	}
+}
+func CloseContext(ctx context.Context) error {
+	if std == nil {
+		return nil
+	}
+	return std.CloseContext(ctx)
+}
 func Close() {
-	if std != nil {
-		std.Close()
+	if err := CloseContext(context.Background()); err != nil {
+		logger.Ex(context.Background(), "producer.Close", "close failed", "error", err)
 	}
 }
 
@@ -240,5 +261,5 @@ func appendTraceId(ctx context.Context, body []byte) []byte {
 }
 
 func legacyOptions() Options {
-	return Options{KafkaEnabled: cast.ToBool(config.GetConfDefault("KafkaProxy", "enable", "false")), Kafka: kafka.LegacyOptions(), BufferLimit: cast.ToInt(config.GetConfDefault("Producer", "bufferLimit", "2000")), GrayMode: cast.ToBool(config.GetConfDefault("MQProxy", "grayMode", "false"))}
+	return Options{KafkaEnabled: cast.ToBool(configsource.GetConfDefault("KafkaProxy", "enable", "false")), Kafka: kafka.LegacyOptions(), BufferLimit: cast.ToInt(configsource.GetConfDefault("Producer", "bufferLimit", "2000")), GrayMode: cast.ToBool(configsource.GetConfDefault("MQProxy", "grayMode", "false"))}
 }

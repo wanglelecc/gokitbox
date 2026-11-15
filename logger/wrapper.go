@@ -2,8 +2,10 @@ package logger
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 )
 
@@ -36,7 +38,7 @@ func NewConfig() *Config {
 	return config
 }
 
-//自定义config Init
+// 自定义config Init
 func InitWithConfig(config *Config) {
 	if config.FileName == "" {
 		fmt.Fprintf(os.Stderr, "InitLoggerConfig: Error: config could not found logpath %s\n", config.FileName)
@@ -52,4 +54,23 @@ func NewContext() context.Context {
 
 func WithContext(ctx context.Context) context.Context {
 	return context.WithValue(ctx, "request_time", time.Now().UnixNano()/1e6)
+}
+
+// Initialize is the error-returning alternative for application lifecycle owners.
+func Initialize(config *Config) error {
+	if config == nil || config.FileName == "" {
+		return errors.New("logger: fileName is required")
+	}
+	copyConfig := *config
+	copyConfig.Level = strings.ToUpper(config.Level)
+	if copyConfig.Level == "WARN" {
+		copyConfig.Level = "WARNING"
+	}
+	switch copyConfig.Level {
+	case "DEBUG", "INFO", "WARNING", "ERROR", "DPANIC", "PANIC", "FATAL":
+	default:
+		return errors.New("logger: unsupported level")
+	}
+	stdBuilder.LoadConfig(&copyConfig)
+	return nil
 }

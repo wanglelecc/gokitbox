@@ -2,6 +2,7 @@ package consumer
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -11,6 +12,10 @@ import (
 )
 
 type ConsumeManager struct {
+	stopOnce  sync.Once
+	closeDone chan struct{}
+	closeErr  error
+
 	cfg      *Configure
 	wg       *sync.WaitGroup
 	kafka    *KafkaConsumer
@@ -72,65 +77,52 @@ func NewConsumeManagerWithConfig(cfg *Configure, callback ConsumeCallback, alert
 	return manager, nil
 }
 
-// CloseWithTimeout 带超时的优雅关闭
+// CloseWithTimeout preserves the old API while reporting incomplete drains.
 func (c *ConsumeManager) CloseWithTimeout(timeout time.Duration) {
-	if !atomic.CompareAndSwapInt32(&c.closed, 0, 1) {
-		return
-	}
-
-	ctx := context.Background()
-	logger.Ix(ctx, "ConsumeManager", fmt.Sprintf(
-		"Closing all consumers (timeout: %v)", timeout))
-
-	startTime := time.Now()
-
-	// 计算每个组件的超时时间（预留10%的 buffer）
-	perConsumerTimeout := timeout * 9 / 10
-
-	// 并发关闭所有消费者
-	var wg sync.WaitGroup
-	closeConsumer := func(name string, closer func(time.Duration)) {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			start := time.Now()
-			closer(perConsumerTimeout)
-			logger.Dx(ctx, "ConsumeManager", fmt.Sprintf(
-				"%s closed in %v", name, time.Since(start)))
-		}()
-	}
-
-	if c.cfg.Enabled.Kafka && c.kafka != nil {
-		closeConsumer("Kafka", c.kafka.CloseWithTimeout)
-	}
-	if c.cfg.Enabled.Rabbitmq && c.rabbitmq != nil {
-		closeConsumer("RabbitMQ", c.rabbitmq.CloseWithTimeout)
-	}
-	if c.cfg.Enabled.Redis && c.redis != nil {
-		closeConsumer("Redis", c.redis.CloseWithTimeout)
-	}
-	if c.cfg.Enabled.Delay && c.delay != nil {
-		closeConsumer("Delay", c.delay.CloseWithTimeout)
-	}
-
-	// 等待所有关闭完成（带超时保护）
-	done := make(chan struct{})
-	go func() {
-		wg.Wait()
-		close(done)
-	}()
-
-	select {
-	case <-done:
-		logger.Ix(ctx, "ConsumeManager", fmt.Sprintf(
-			"All consumers closed in %v", time.Since(startTime)))
-	case <-time.After(timeout):
-		logger.Wx(ctx, "ConsumeManager", fmt.Sprintf(
-			"Consumer close timeout after %v", timeout))
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	if err := c.CloseContext(ctx); err != nil {
+		logger.Wx(context.Background(), "ConsumeManager", "shutdown incomplete", "error", err)
 	}
 }
-
-// Close 保持向后兼容（使用合理的默认超时）
-func (c *ConsumeManager) Close() {
-	c.CloseWithTimeout(30 * time.Second)
+func (c *ConsumeManager) Close() { c.CloseWithTimeout(30 * time.Second) }
+func (c *ConsumeManager) CloseContext(ctx context.Context) error {
+	c.stopOnce.Do(func() {
+		c.closeDone = make(chan struct{})
+		atomic.StoreInt32(&c.closed, 1)
+		go func() {
+			defer close(c.closeDone)
+			var wg sync.WaitGroup
+			var mu sync.Mutex
+			stop := func(close func(context.Context) error) {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					err := close(context.WithoutCancel(ctx))
+					mu.Lock()
+					c.closeErr = errors.Join(c.closeErr, err)
+					mu.Unlock()
+				}()
+			}
+			if c.kafka != nil {
+				stop(c.kafka.CloseContext)
+			}
+			if c.rabbitmq != nil {
+				stop(c.rabbitmq.CloseContext)
+			}
+			if c.redis != nil {
+				stop(c.redis.CloseContext)
+			}
+			if c.delay != nil {
+				stop(c.delay.CloseContext)
+			}
+			wg.Wait()
+		}()
+	})
+	select {
+	case <-c.closeDone:
+		return c.closeErr
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }

@@ -20,7 +20,7 @@ go get github.com/wanglelecc/gokitbox
 
 | 模块 | 路径 | 说明 | 状态 |
 |------|------|------|------|
-| `config` | `github.com/wanglelecc/gokitbox/config` | 配置管理（INI/YAML） | 可用 |
+| `configsource` | `github.com/wanglelecc/gokitbox/configsource` | 配置源读取与解码（INI/YAML） | 可用 |
 | `logger` | `github.com/wanglelecc/gokitbox/logger` | 结构化日志（Zap） | 可用 |
 | `httpserver` | `github.com/wanglelecc/gokitbox/httpserver` | HTTP 服务（Gin） | 可用 |
 | `rpcxserver` | `github.com/wanglelecc/gokitbox/rpcxserver` | RPC 服务（rpcx） | 可用 |
@@ -75,18 +75,18 @@ func main() {
 ### 2. 配置读取
 
 ```go
-import "github.com/wanglelecc/gokitbox/config"
+import "github.com/wanglelecc/gokitbox/configsource"
 
 // 获取配置
-name := config.GetConf("app", "name")
-port := config.GetConfDefault("server", "port", "8080")
+name := configsource.GetConf("app", "name")
+port := configsource.GetConfDefault("server", "port", "8080")
 
 // 获取数组（空格分隔的值自动切分）
-hosts := config.GetConfArr("database", "hosts")
+hosts := configsource.GetConfArr("database", "hosts")
 
 // 映射到结构体
 var cfg ServerConfig
-config.ConfMapToStruct("server", &cfg)
+configsource.ConfMapToStruct("server", &cfg)
 ```
 
 ### 3. 数据库操作
@@ -230,7 +230,7 @@ go build -tags consul ./...
 ```
 gokitbox/
 ├── bootstrap/      # 启动引导组件
-├── config/         # 配置管理
+├── configsource/         # 配置管理
 ├── dbdao/          # 数据库访问
 ├── event/          # 事件分发器
 ├── httpserver/     # HTTP 服务

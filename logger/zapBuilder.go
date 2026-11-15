@@ -48,6 +48,8 @@ func (log *zapBuilder) LoadConfig(config *Config) {
 		lvl = zapcore.ErrorLevel
 	case "FATAL":
 		lvl = zapcore.FatalLevel
+	case "DPANIC":
+		lvl = zapcore.DPanicLevel
 	case "PANIC":
 		lvl = zapcore.PanicLevel
 	default:
@@ -119,6 +121,8 @@ func (log *zapBuilder) LoggerW(ctx context.Context, mod bool, lvl string, tag st
 		sugar.Errorw(message, fields...)
 	case "FATAL":
 		sugar.Fatalw(message, fields...)
+	case "DPANIC":
+		sugar.DPanicw(message, fields...)
 	case "PANIC":
 		sugar.Panicw(message, fields...)
 	}

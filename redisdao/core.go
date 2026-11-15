@@ -8,7 +8,7 @@ import (
 	"time"
 
 	"github.com/redis/go-redis/v9"
-	"github.com/wanglelecc/gokitbox/config"
+	"github.com/wanglelecc/gokitbox/configsource"
 )
 
 var initOnce sync.Once
@@ -45,7 +45,7 @@ func Init() {
 func legacyOptions() Options {
 	result := Options{Instances: map[string]redis.Options{}}
 
-	confMapList := config.GetConfArrayMap("Redis")
+	confMapList := configsource.GetConfArrayMap("Redis")
 	for k, v := range confMapList {
 		options := redis.Options{
 			Username:     "",
@@ -58,7 +58,7 @@ func legacyOptions() Options {
 			MaxRetries:   0,
 		}
 
-		if p := config.GetConf("RedisConfig", k+".db"); p != "" {
+		if p := configsource.GetConf("RedisConfig", k+".db"); p != "" {
 			if rt, err := strconv.Atoi(p); err == nil {
 				options.DB = rt
 			} else {
@@ -68,7 +68,7 @@ func legacyOptions() Options {
 
 		// 连接池最大连接数量，注意：这里不包括 pub/sub，pub/sub 将使用独立的网络连接
 		// 默认为 10 * runtime.GOMAXPROCS
-		if p := config.GetConf("RedisConfig", k+".poolsize"); p != "" {
+		if p := configsource.GetConf("RedisConfig", k+".poolsize"); p != "" {
 			if rt, err := strconv.Atoi(p); err == nil {
 				options.PoolSize = rt
 			} else {
@@ -78,7 +78,7 @@ func legacyOptions() Options {
 
 		// 连接池保持的最小空闲连接数，它受到PoolSize的限制
 		// 默认为0，不保持
-		if p := config.GetConf("RedisConfig", k+".minidleconns"); p != "" {
+		if p := configsource.GetConf("RedisConfig", k+".minidleconns"); p != "" {
 			if rt, err := strconv.Atoi(p); err == nil {
 				options.MinIdleConns = rt
 			} else {
@@ -90,7 +90,7 @@ func legacyOptions() Options {
 		//  0 - 默认值，3秒
 		// -1 - 无超时，无限期的阻塞
 		// -2 - 不进行超时设置，不调用 SetReadDeadline 方法
-		if p := config.GetConf("RedisConfig", k+".readtimeout"); p != "" {
+		if p := configsource.GetConf("RedisConfig", k+".readtimeout"); p != "" {
 			if rt, err := strconv.Atoi(p); err == nil {
 				options.ReadTimeout = time.Second * time.Duration(rt)
 			} else {
@@ -102,7 +102,7 @@ func legacyOptions() Options {
 		//  0 - 默认值，3秒
 		// -1 - 无超时，无限期的阻塞
 		// -2 - 不进行超时设置，不调用 SetWriteDeadline 方法
-		if p := config.GetConf("RedisConfig", k+".writetimeout"); p != "" {
+		if p := configsource.GetConf("RedisConfig", k+".writetimeout"); p != "" {
 			if rt, err := strconv.Atoi(p); err == nil {
 				options.WriteTimeout = time.Second * time.Duration(rt)
 			} else {
@@ -113,7 +113,7 @@ func legacyOptions() Options {
 		// 当redis服务器版本在6.0以上时，作为ACL认证信息配合密码一起使用，
 		// ACL是redis 6.0以上版本提供的认证功能，6.0以下版本仅支持密码认证。
 		// 默认为空，不进行认证。
-		if p := config.GetConf("RedisConfig", k+".username"); p != "" {
+		if p := configsource.GetConf("RedisConfig", k+".username"); p != "" {
 			options.Username = p
 		}
 
@@ -121,15 +121,15 @@ func legacyOptions() Options {
 		// 当redis服务器版本在6.0以下时，仅作为密码认证。
 		// ACL是redis 6.0以上版本提供的认证功能，6.0以下版本仅支持密码认证。
 		// 默认为空，不进行认证。
-		if p := config.GetConf("RedisConfig", k+".password"); p != "" {
+		if p := configsource.GetConf("RedisConfig", k+".password"); p != "" {
 			options.Password = p
 		}
 
-		if p := config.GetConf("RedisConfig", k+".tlsinsecureskip"); p == "true" {
+		if p := configsource.GetConf("RedisConfig", k+".tlsinsecureskip"); p == "true" {
 			options.TLSConfig = &tls.Config{InsecureSkipVerify: true}
 		}
 
-		if p := config.GetConf("RedisConfig", k+".maxretries"); p != "" {
+		if p := configsource.GetConf("RedisConfig", k+".maxretries"); p != "" {
 			if rt, err := strconv.Atoi(p); err == nil {
 				options.MaxRetries = rt
 			} else {

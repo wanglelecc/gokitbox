@@ -27,7 +27,7 @@ package main
 
 import (
     "github.com/wanglelecc/gokitbox/bootstrap"
-    "github.com/wanglelecc/gokitbox/config"
+    "github.com/wanglelecc/gokitbox/configsource"
     "github.com/wanglelecc/gokitbox/httpserver"
 )
 

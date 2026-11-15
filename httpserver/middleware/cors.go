@@ -9,7 +9,7 @@ import (
 
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
-	"github.com/wanglelecc/gokitbox/config"
+	"github.com/wanglelecc/gokitbox/configsource"
 )
 
 // Config represents all available options for the middleware.
@@ -72,7 +72,7 @@ func Cors() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		once.Do(func() {
 			var cfg Config
-			if err := config.ConfMapToStruct("HttpCors", &cfg); err != nil {
+			if err := configsource.ConfMapToStruct("HttpCors", &cfg); err != nil {
 				initErr = fmt.Errorf("cors: failed to load [HttpCors] config: %w", err)
 				return
 			}

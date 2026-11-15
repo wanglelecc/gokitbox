@@ -124,11 +124,11 @@ go get github.com/wanglelecc/gokitbox/worker
 ## 初始化
 ```go
 import (
-    "github.com/wanglelecc/gokitbox/config"
+    "github.com/wanglelecc/gokitbox/configsource"
     "github.com/wanglelecc/gokitbox/worker"
 )
 
-appCfg := config.GetConfStringMap("App")
+appCfg := configsource.GetConfStringMap("App")
 
 s := worker.NewWorker()
 s.AddBeforeServerStartFunc(
@@ -188,3 +188,9 @@ if report.Redis != nil {
 ## 服务骨架示例
 https://github.com/wanglelecc/gokitbox/worker-demo
 > 新项目可以直接克隆，替换名称并直接使用。
+
+### 应用层资源分组与 Kafka 失败投递
+
+应用可以在主 YAML 中按资源组织多个 topic/queue，再解析为本库的显式 `consumer.Configure`。命名实例引用、订阅 defaults 与覆盖关系属于应用加载层；本库不查找应用的全局资源配置，旧 JSON/YAML Configure 继续兼容。
+
+Kafka 失败消息 Producer 按 broker 地址集合和 SASL 认证信息分别创建；同连接多个 topic 复用 Producer，不同连接或凭据互相隔离。Producer 使用对应消费者资源的认证设置，初始化失败时回收已创建资源，关闭时统一 Flush/Close。此处保留现有 SASL/PLAIN 协议选项，没有新增 TLS 配置。

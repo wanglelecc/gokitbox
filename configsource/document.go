@@ -1,4 +1,4 @@
-package config
+package configsource
 
 import (
 	"bytes"

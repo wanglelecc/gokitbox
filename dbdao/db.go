@@ -7,7 +7,7 @@ import (
 
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/spf13/cast"
-	"github.com/wanglelecc/gokitbox/config"
+	"github.com/wanglelecc/gokitbox/configsource"
 	"xorm.io/xorm"
 )
 
@@ -48,8 +48,8 @@ func InitWithOptions(o Options) error {
 }
 
 func legacyOptions() Options {
-	values := config.GetConfStringMap("MysqlConfig")
-	o := Options{Driver: "mysql", Clusters: config.GetConfArrayMap("MysqlCluster"), ShowSql: values["showSql"] == "true", SlowDuration: time.Duration(cast.ToInt(values["slowDuration"])) * time.Millisecond, MaxOpenConns: 100, MaxIdleConns: 30, ConnMaxLifetime: 3000 * time.Second}
+	values := configsource.GetConfStringMap("MysqlConfig")
+	o := Options{Driver: "mysql", Clusters: configsource.GetConfArrayMap("MysqlCluster"), ShowSql: values["showSql"] == "true", SlowDuration: time.Duration(cast.ToInt(values["slowDuration"])) * time.Millisecond, MaxOpenConns: 100, MaxIdleConns: 30, ConnMaxLifetime: 3000 * time.Second}
 	if n := cast.ToInt(values["maxConn"]); n > 0 {
 		o.MaxOpenConns = n
 	}
@@ -122,3 +122,6 @@ func Init() {
 		panic(err)
 	}
 }
+
+// Initialize constructs engines using previously configured module Options.
+func Initialize() error { return initialize() }

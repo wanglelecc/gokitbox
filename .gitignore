@@ -6,3 +6,6 @@ run/
 logs/
 log/
 config/conf.ini
+
+# Go tests are kept locally and excluded from version control.
+*_test.go

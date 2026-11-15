@@ -8,7 +8,7 @@ import (
 	"os"
 	"strings"
 
-	"github.com/wanglelecc/gokitbox/config"
+	"github.com/wanglelecc/gokitbox/configsource"
 	"github.com/wanglelecc/gokitbox/dbdao"
 	"github.com/wanglelecc/gokitbox/logger"
 	"github.com/wanglelecc/gokitbox/producer"
@@ -22,7 +22,7 @@ type BeforeServerStartFunc func() error
 func InitLogger(env, appName, department, version string) BeforeServerStartFunc {
 	return func() error {
 		section := "Log"
-		logMap := config.GetConfStringMap(section) // 通过配置文件转为map[string]string
+		logMap := configsource.GetConfStringMap(section) // 通过配置文件转为map[string]string
 
 		var fileName string
 		fileName, _ = logMap["fileName"]
@@ -52,7 +52,7 @@ func InitLogger(env, appName, department, version string) BeforeServerStartFunc 
 
 func InitPprof() BeforeServerStartFunc {
 	return func() error {
-		enable := config.GetConf("Pprof", "enable")
+		enable := configsource.GetConf("Pprof", "enable")
 		if enable == "true" {
 			go pprofStart()
 		}
@@ -62,7 +62,7 @@ func InitPprof() BeforeServerStartFunc {
 
 func pprofStart() {
 	ctx := context.Background()
-	port := config.GetConf("Pprof", "port")
+	port := configsource.GetConf("Pprof", "port")
 
 	if len(port) <= 0 {
 		logger.Ex(ctx, "Pprof", fmt.Sprintf("pprof port:%s format wrong", port))

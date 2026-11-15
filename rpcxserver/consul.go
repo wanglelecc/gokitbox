@@ -40,6 +40,7 @@ func AddRegistryPlugin(s *Server) error {
 	}
 
 	s.server.Plugins.Add(plugin)
+	s.registryStops = append(s.registryStops, plugin.Stop)
 
 	return nil
 }

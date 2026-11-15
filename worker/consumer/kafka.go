@@ -20,6 +20,10 @@ const (
 )
 
 type KafkaConsumer struct {
+	stopOnce  sync.Once
+	closeDone chan struct{}
+	closeErr  error
+
 	quit         chan struct{}
 	callback     ConsumeCallback
 	successCount int64
@@ -32,8 +36,8 @@ type KafkaConsumer struct {
 	panicCount       int64
 	restartCount     int64
 
-	// produce 在 NewKafkaConsumer 启动时初始化（fail-fast），避免消费中途初始化失败导致死循环
-	produce *kafka.Producer
+	// Failure producers are initialized per connection before launching consumers.
+	producers map[kafkaConnection]kafkaFailureProducer
 
 	alertMgr *AlertManager
 }
@@ -49,20 +53,19 @@ func NewKafkaConsumer(configs []*KafkaConfig, callback ConsumeCallback, alertMgr
 	consumer.quit = make(chan struct{})
 	consumer.wg = new(sync.WaitGroup)
 
-	consumer.wg.Add(1)
-	go consumer.count()
-
-	// 如有任何配置了 FailTopic，启动时初始化 Producer（fail-fast）
-	// 所有 config 共用同一 Producer，假设同一 Kafka 集群
+	// The manager validates runtime Options. Keep direct constructor compatibility
+	// (including nil SASL for plaintext), but reject nil entries before allocation.
 	for _, cfg := range configs {
-		if cfg.FailTopic != "" {
-			consumer.produce, err = newKafkaProducer(cfg)
-			if err != nil {
-				return nil, fmt.Errorf("init kafka producer: %w", err)
-			}
-			break
+		if cfg == nil {
+			return nil, errors.New("kafka: nil consumer configuration")
 		}
 	}
+	consumer.producers, err = createFailureProducers(configs, func(cfg *KafkaConfig) (kafkaFailureProducer, error) { return newKafkaProducer(cfg) })
+	if err != nil {
+		return nil, err
+	}
+	consumer.wg.Add(1)
+	go consumer.count()
 
 	for _, config := range configs {
 		for i := 0; i < config.ConsumerCount; i++ {
@@ -76,37 +79,41 @@ func NewKafkaConsumer(configs []*KafkaConfig, callback ConsumeCallback, alertMgr
 
 // CloseWithTimeout 带超时的优雅关闭
 func (k *KafkaConsumer) CloseWithTimeout(timeout time.Duration) {
-	if !atomic.CompareAndSwapInt32(&k.closed, 0, 1) {
-		return
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	if err := k.CloseContext(ctx); err != nil {
+		logger.Wx(context.Background(), "KafkaConsumer.Close", "shutdown incomplete", "error", err)
 	}
+}
 
-	ctx := context.Background()
-	tag := "KafkaClose"
+// CloseContext reports the actual drain outcome. A retry waits for the same
+// shutdown instead of returning success while the first caller is still draining.
+func (k *KafkaConsumer) CloseContext(ctx context.Context) error {
+	k.stopOnce.Do(func() {
+		k.closeDone = make(chan struct{})
+		atomic.StoreInt32(&k.closed, 1)
+		close(k.quit)
+		go func() {
+			defer close(k.closeDone)
+			k.wg.Wait()
+			deadline := time.Now().Add(10 * time.Second)
+			if configured, ok := ctx.Deadline(); ok && configured.Before(deadline) {
+				deadline = configured
+			}
+			for _, producer := range k.producers {
+				if remaining := producer.Flush(int(max(0, time.Until(deadline)).Milliseconds())); remaining > 0 {
+					k.closeErr = errors.Join(k.closeErr, fmt.Errorf("kafka: %d messages not flushed", remaining))
+				}
+				producer.Close()
+			}
 
-	logger.Ix(ctx, tag, fmt.Sprintf("Closing Kafka consumer (timeout: %v)", timeout))
-	close(k.quit)
-
-	done := make(chan struct{})
-	go func() {
-		k.wg.Wait()
-		close(done)
-	}()
-
+		}()
+	})
 	select {
-	case <-done:
-		logger.Ix(ctx, tag, "Kafka consumer closed gracefully")
-	case <-time.After(timeout):
-		logger.Wx(ctx, tag, fmt.Sprintf(
-			"Kafka consumer close timeout after %v, some goroutines may still be running", timeout))
-	}
-
-	// Flush 并关闭 Producer：确保 FailTopic 缓冲消息全部投递后再退出
-	if k.produce != nil {
-		remaining := k.produce.Flush(int(timeout.Milliseconds()))
-		if remaining > 0 {
-			logger.Wx(ctx, tag, fmt.Sprintf("producer flush timeout, %d messages unsent", remaining))
-		}
-		k.produce.Close()
+	case <-k.closeDone:
+		return k.closeErr
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 
@@ -186,25 +193,7 @@ func (k *KafkaConsumer) initKafka(cfg *KafkaConfig) (*kafka.Consumer, error) {
 
 // newKafkaProducer 创建 Kafka Producer，供 NewKafkaConsumer 在启动时调用（fail-fast）
 func newKafkaProducer(cfg *KafkaConfig) (*kafka.Producer, error) {
-	pCfg := &kafka.ConfigMap{
-		"bootstrap.servers":             strings.Join(cfg.Host, ","),
-		"api.version.request":           "true",
-		"message.max.bytes":             1000000,
-		"linger.ms":                     500,
-		"sticky.partitioning.linger.ms": 1000,
-
-		// 请求发生错误时重试次数，建议将该值设置为大于0，失败重试最大程度保证消息不丢失
-		"retries": INT32_MAX,
-
-		// 发送请求失败时到下一次重试请求之间的时间
-		"retry.backoff.ms": 1000,
-
-		// 设置客户端内部重试间隔
-		"reconnect.backoff.max.ms": 3000,
-
-		// 用户不显式配置时，默认值为1
-		"acks": "1",
-	}
+	pCfg := kafkaProducerOptions(cfg)
 
 	p, err := kafka.NewProducer(pCfg)
 	if err != nil {
@@ -345,7 +334,7 @@ func (k *KafkaConsumer) doConsume(ctx context.Context, config *KafkaConfig, bo *
 				if config.FailTopic != "" {
 					sent := false
 					for i := 0; i < 3; i++ {
-						if err := k.sendByHashPartition(config.FailTopic, event.Value, event.Key); err != nil {
+						if err := k.sendByHashPartition(config, config.FailTopic, event.Value, event.Key); err != nil {
 							logger.Ex(ctx, "KafkaConsume", fmt.Sprintf("SendToFailTopic error:%s %s %v", config.FailTopic, string(event.Value), err))
 							select {
 							case <-k.quit:
@@ -417,8 +406,9 @@ func (k *KafkaConsumer) doConsume(ctx context.Context, config *KafkaConfig, bo *
 }
 
 // sendByHashPartition 同步发送消息到指定 topic，等待 broker 确认后才返回
-func (k *KafkaConsumer) sendByHashPartition(topic string, data []byte, key []byte) error {
-	if k.produce == nil {
+func (k *KafkaConsumer) sendByHashPartition(cfg *KafkaConfig, topic string, data []byte, key []byte) error {
+	producer := k.producers[kafkaResourceKey(cfg)]
+	if producer == nil {
 		return fmt.Errorf("producer not initialized (FailTopic requires a valid producer)")
 	}
 
@@ -428,7 +418,7 @@ func (k *KafkaConsumer) sendByHashPartition(topic string, data []byte, key []byt
 		Value:          data,
 		Key:            key,
 	}
-	if err := k.produce.Produce(msg, deliveryChan); err != nil {
+	if err := producer.Produce(msg, deliveryChan); err != nil {
 		return fmt.Errorf("produce: %w", err)
 	}
 

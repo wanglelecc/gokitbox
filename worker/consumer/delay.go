@@ -16,6 +16,10 @@ import (
 )
 
 type DelayConsumer struct {
+	stopOnce  sync.Once
+	closeDone chan struct{}
+	closeErr  error
+
 	quit         chan struct{}
 	callback     ConsumeCallback
 	wg           *sync.WaitGroup
@@ -265,37 +269,35 @@ func (d *DelayConsumer) pop(ctx context.Context, client *redis.Client, queue str
 
 // CloseWithTimeout 带超时的优雅关闭
 func (d *DelayConsumer) CloseWithTimeout(timeout time.Duration) {
-	// 使用 atomic CAS 确保只关闭一次
-	if !atomic.CompareAndSwapInt32(&d.closed, 0, 1) {
-		// 已经关闭过了，直接返回
-		return
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	if err := d.CloseContext(ctx); err != nil {
+		logger.Wx(context.Background(), "DelayConsumer.Close", "shutdown incomplete", "error", err)
 	}
+}
 
-	ctx := context.Background()
-	tag := "DelayClose"
-
-	logger.Ix(ctx, tag, fmt.Sprintf("Closing Delay consumer (timeout: %v)", timeout))
-	close(d.quit)
-
-	done := make(chan struct{})
-	go func() {
-		d.wg.Wait()
-		close(done)
-	}()
-
+// CloseContext reports the actual drain outcome. A retry waits for the same
+// shutdown instead of returning success while the first caller is still draining.
+func (d *DelayConsumer) CloseContext(ctx context.Context) error {
+	d.stopOnce.Do(func() {
+		d.closeDone = make(chan struct{})
+		atomic.StoreInt32(&d.closed, 1)
+		close(d.quit)
+		go func() {
+			defer close(d.closeDone)
+			d.wg.Wait()
+			for _, client := range d.clients {
+				if err := client.Close(); err != nil {
+					d.closeErr = errors.Join(d.closeErr, err)
+				}
+			}
+		}()
+	})
 	select {
-	case <-done:
-		logger.Ix(ctx, tag, "Delay consumer closed gracefully")
-	case <-time.After(timeout):
-		logger.Wx(ctx, tag, fmt.Sprintf(
-			"Delay consumer close timeout after %v", timeout))
-	}
-
-	// 关闭所有 redis 客户端
-	for _, client := range d.clients {
-		if err := client.Close(); err != nil {
-			logger.Ex(ctx, tag, "Close redis client error", "error", err.Error())
-		}
+	case <-d.closeDone:
+		return d.closeErr
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 

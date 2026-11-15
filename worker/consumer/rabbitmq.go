@@ -16,6 +16,10 @@ import (
 )
 
 type RabbitmqConsumer struct {
+	stopOnce  sync.Once
+	closeDone chan struct{}
+	closeErr  error
+
 	quit     chan struct{}
 	callback ConsumeCallback
 	wg       *sync.WaitGroup
@@ -55,27 +59,30 @@ func NewRabbitmqConsumer(configs []*RabbitmqConfig, callback ConsumeCallback, al
 
 // CloseWithTimeout 带超时的优雅关闭
 func (r *RabbitmqConsumer) CloseWithTimeout(timeout time.Duration) {
-	if !atomic.CompareAndSwapInt32(&r.closed, 0, 1) {
-		return
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	if err := r.CloseContext(ctx); err != nil {
+		logger.Wx(context.Background(), "RabbitmqConsumer.Close", "shutdown incomplete", "error", err)
 	}
+}
 
-	ctx := context.Background()
-	tag := "RabbitmqClose"
-
-	logger.Ix(ctx, tag, fmt.Sprintf("Closing RabbitMQ consumer (timeout: %v)", timeout))
-	close(r.quit)
-
-	done := make(chan struct{})
-	go func() {
-		r.wg.Wait()
-		close(done)
-	}()
-
+// CloseContext reports the actual drain outcome. A retry waits for the same
+// shutdown instead of returning success while the first caller is still draining.
+func (r *RabbitmqConsumer) CloseContext(ctx context.Context) error {
+	r.stopOnce.Do(func() {
+		r.closeDone = make(chan struct{})
+		atomic.StoreInt32(&r.closed, 1)
+		close(r.quit)
+		go func() {
+			defer close(r.closeDone)
+			r.wg.Wait()
+		}()
+	})
 	select {
-	case <-done:
-		logger.Ix(ctx, tag, "RabbitMQ consumer closed gracefully")
-	case <-time.After(timeout):
-		logger.Wx(ctx, tag, fmt.Sprintf("RabbitMQ consumer close timeout after %v", timeout))
+	case <-r.closeDone:
+		return r.closeErr
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 

@@ -10,7 +10,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/wanglelecc/gokitbox/config"
+	"github.com/wanglelecc/gokitbox/configsource"
 )
 
 var (
@@ -102,7 +102,7 @@ func LoadConfigure(path string) (*Configure, error) {
 	cfg := new(Configure)
 	switch strings.ToLower(filepath.Ext(path)) {
 	case ".yaml", ".yml":
-		doc, err := config.ReadYAML(path)
+		doc, err := configsource.ReadYAML(path)
 		if err != nil {
 			return nil, err
 		}
@@ -138,7 +138,7 @@ func loadConfigure() *Configure {
 	configPathLock.RUnlock()
 	// An explicit caller path always wins over legacy App.workerConfigPath.
 	if !explicit {
-		cp = config.GetConfDefault("App", "workerConfigPath", cp)
+		cp = configsource.GetConfDefault("App", "workerConfigPath", cp)
 	}
 	cfg, err := LoadConfigure(cp)
 	if err != nil {
@@ -167,8 +167,16 @@ func (c *Configure) Validate() error {
 			if v == nil || len(v.Host) == 0 || v.Topic == "" || v.ConsumerGroup == "" || v.ConsumerCount <= 0 || v.FailCount < 0 {
 				return fmt.Errorf("worker: invalid kafka consumer")
 			}
+			for _, host := range v.Host {
+				if strings.TrimSpace(host) == "" {
+					return fmt.Errorf("worker: empty Kafka broker")
+				}
+			}
 			if v.SASL == nil {
 				return fmt.Errorf("worker: kafka sasl configuration is required (enabled: false to disable)")
+			}
+			if v.SASL.Enabled && (v.SASL.User == "" || v.SASL.Password == "") {
+				return fmt.Errorf("worker: enabled Kafka SASL requires user and password")
 			}
 		}
 	}
@@ -177,7 +185,7 @@ func (c *Configure) Validate() error {
 			return fmt.Errorf("worker: rabbitmq consumers are required")
 		}
 		for _, v := range c.Rabbitmq {
-			if v == nil || v.URL == "" || v.ConsumerQueue == "" || v.ConsumerCount <= 0 || v.FailCount < 0 {
+			if v == nil || v.URL == "" || v.ConsumerQueue == "" || v.ConsumerCount <= 0 || v.FailCount < 0 || v.PrefetchCount < 0 {
 				return fmt.Errorf("worker: invalid rabbitmq consumer")
 			}
 		}

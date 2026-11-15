@@ -111,3 +111,7 @@ https://doc.rpcx.io/
 ## 服务骨架示例
 https://github.com/wanglelecc/gokitbox/rpcxserver-demo
 > 新项目可以直接克隆，替换名称并直接使用。
+
+### 应用统一管理生命周期
+
+新增 `Start(ctx) / Wait() / Stop(ctx)`，不注册 OS signal。Start 执行 before 初始化钩子；资源关闭由应用登记 Stop，旧 after 钩子不在新路径执行。Start 同步绑定并等待 accept loop 就绪，Wait 返回意外结束，Stop 在调用方 context 内等待 RPC、注册中心插件与 nonce 清理。清理超时返回错误；后续 Stop 等待同一次清理。旧 Serve 继续兼容，不应与新接口混用。

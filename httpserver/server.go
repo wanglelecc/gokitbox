@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -12,7 +13,7 @@ import (
 	"time"
 
 	"github.com/wanglelecc/gokitbox/bootstrap"
-	"github.com/wanglelecc/gokitbox/config"
+	"github.com/wanglelecc/gokitbox/configsource"
 	"github.com/wanglelecc/gokitbox/httpserver/validator"
 	"github.com/wanglelecc/gokitbox/logger"
 
@@ -28,7 +29,10 @@ type Server struct {
 	sigChan         chan os.Signal // 接收系统退出信号
 	shutdownDone    chan struct{}  // 用于同步 shutdown 完成
 	shutdownTimeout int64          // 优雅关闭超时时间，原子读写（单位：纳秒）
-	served          int32          // atomic 防重入：0=未启动，1=已启动
+	runDone         chan struct{}
+	runErr          error
+	runListener     net.Listener
+	served          int32 // atomic 防重入：0=未启动，1=已启动
 }
 
 // NewServer 从配置文件 [HttpServer] 段加载配置并创建 Server。
@@ -40,7 +44,7 @@ func NewServer(section ...string) (*Server, error) {
 	}
 
 	var opts ServerOptions
-	if err := config.ConfMapToStruct(sec, &opts); err != nil {
+	if err := configsource.ConfMapToStruct(sec, &opts); err != nil {
 		// 配置加载失败，使用默认配置
 		opts = DefaultOptions()
 	} else {
@@ -249,7 +253,7 @@ func (s *Server) InitConfig(ops ...string) error {
 	}
 
 	var opts ServerOptions
-	if err := config.ConfMapToStruct(sec, &opts); err != nil {
+	if err := configsource.ConfMapToStruct(sec, &opts); err != nil {
 		return err
 	}
 
@@ -287,5 +291,55 @@ func (s *Server) InitConfig(ops ...string) error {
 	s.server.IdleTimeout, _ = opts.GetIdleTimeout()
 	atomic.StoreInt64(&s.shutdownTimeout, int64(shutdownTimeout))
 
+	return nil
+}
+
+// Start binds synchronously and launches serving without owning OS signals.
+// The context bounds startup only; Stop owns graceful termination.
+func (s *Server) Start(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if !atomic.CompareAndSwapInt32(&s.served, 0, 1) {
+		return fmt.Errorf("httpserver: already started")
+	}
+	for _, fn := range s.beforeFuncs {
+		if err := fn(); err != nil {
+			return err
+		}
+	}
+	listener, err := net.Listen("tcp", s.server.Addr)
+	if err != nil {
+		return err
+	}
+	s.runListener = listener
+	s.runDone = make(chan struct{})
+	go func() {
+		err := s.server.Serve(listener)
+		if errors.Is(err, http.ErrServerClosed) {
+			err = nil
+		}
+		s.runErr = err
+		close(s.runDone)
+	}()
+	return nil
+}
+func (s *Server) Wait() error {
+	if s.runDone == nil {
+		return fmt.Errorf("httpserver: not started")
+	}
+	<-s.runDone
+	return s.runErr
+}
+func (s *Server) Stop(ctx context.Context) error {
+	if s.runListener == nil {
+		return nil
+	}
+	stopCtx, cancel := context.WithTimeout(ctx, time.Duration(atomic.LoadInt64(&s.shutdownTimeout)))
+	defer cancel()
+	err := s.server.Shutdown(stopCtx)
+	if err != nil {
+		return errors.Join(err, s.server.Close())
+	}
 	return nil
 }

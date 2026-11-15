@@ -8,10 +8,12 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"os/signal"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -19,7 +21,7 @@ import (
 	"github.com/smallnest/rpcx/server"
 	"github.com/spf13/cast"
 	"github.com/wanglelecc/gokitbox/bootstrap"
-	"github.com/wanglelecc/gokitbox/config"
+	"github.com/wanglelecc/gokitbox/configsource"
 	"github.com/wanglelecc/gokitbox/logger"
 )
 
@@ -38,12 +40,19 @@ func isShutdownError(err error) bool {
 
 // Server struct
 type Server struct {
-	server       *server.Server
-	Opts         Options
-	beforeFuncs  []bootstrap.BeforeServerStartFunc
-	afterFuncs   []bootstrap.AfterServerStopFunc
-	sigChan      chan os.Signal // 统一信号通道
-	shutdownOnce sync.Once      // 确保只关闭一次
+	runDone       chan struct{}
+	runErr        error
+	runStarted    int32
+	registryStops []func() error
+	runStopErr    error
+	runStopDone   chan struct{}
+	listener      net.Listener
+	server        *server.Server
+	Opts          Options
+	beforeFuncs   []bootstrap.BeforeServerStartFunc
+	afterFuncs    []bootstrap.AfterServerStopFunc
+	sigChan       chan os.Signal // 统一信号通道
+	shutdownOnce  sync.Once      // 确保只关闭一次
 
 	// 平滑关闭配置（不从配置文件读取，使用默认值或通过方法设置）
 	preUnregisterWait  time.Duration // 服务注销前等待，默认2秒
@@ -351,7 +360,7 @@ func (srv *Server) InitConfig(ops ...string) bootstrap.BeforeServerStartFunc {
 			sec = ops[0]
 		}
 
-		err := config.ConfMapToStruct(sec, &srv.Opts)
+		err := configsource.ConfMapToStruct(sec, &srv.Opts)
 		return err
 	}
 }
@@ -360,7 +369,7 @@ func (srv *Server) InitConfig(ops ...string) bootstrap.BeforeServerStartFunc {
 func (srv *Server) InitRegistry() bootstrap.BeforeServerStartFunc {
 	return func() error {
 		regOpts := RegistryOptions{}
-		err := config.ConfMapToStruct("Registry", &regOpts)
+		err := configsource.ConfMapToStruct("Registry", &regOpts)
 
 		if err != nil {
 			return err
@@ -420,7 +429,9 @@ func (srv *Server) validAuthAccess(appId string) (string, bool) {
 
 // InitRpcxAuth 初始化rpcx鉴权
 func (srv *Server) InitRpcxAuth(fns ...ValidAccess) bootstrap.BeforeServerStartFunc {
-	return func() error { return srv.InitRpcxAuthWithOptions(config.GetConfStringMap("ValidRpcxAuth"), fns...)() }
+	return func() error {
+		return srv.InitRpcxAuthWithOptions(configsource.GetConfStringMap("ValidRpcxAuth"), fns...)()
+	}
 }
 
 // InitRpcxAuthWithOptions snapshots the caller's authorization map before use.
@@ -623,7 +634,110 @@ func (srv *Server) stopNonceCleanup() {
 	srv.nonceStopOnce.Do(func() {
 		if srv.nonceCleanupStop != nil {
 			close(srv.nonceCleanupStop)
-			srv.nonceCleanupStop = nil
 		}
 	})
+}
+
+// Start initializes RPC and binds before reporting readiness. No signals are
+// registered on this path; the application owns cancellation and Stop.
+func (srv *Server) Start(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if !atomic.CompareAndSwapInt32(&srv.runStarted, 0, 1) {
+		return errors.New("rpcxserver: already started")
+	}
+	srv.server = server.NewServer()
+	for _, fn := range srv.beforeFuncs {
+		if err := fn(); err != nil {
+			return err
+		}
+	}
+	server.WithReadTimeout(srv.Opts.ReadTimeout)(srv.server)
+	server.WithWriteTimeout(srv.Opts.WriteTimeout)(srv.server)
+	listenNetwork := srv.Opts.Network
+	if listenNetwork == "http" {
+		listenNetwork = "tcp"
+	}
+	listener, err := net.Listen(listenNetwork, net.JoinHostPort(srv.Opts.Addr, srv.Opts.Port))
+	if err != nil {
+		return err
+	}
+	srv.listener = listener
+	srv.runDone = make(chan struct{})
+	ready := make(chan struct{})
+	wrapped := &readyListener{Listener: listener, ready: ready}
+	go func() {
+		defer close(srv.runDone)
+		defer func() {
+			if p := recover(); p != nil {
+				srv.runErr = fmt.Errorf("rpcxserver panic: %v", p)
+			}
+		}()
+		err := srv.server.ServeListener(srv.Opts.Network, wrapped)
+		if err != nil && isShutdownError(err) {
+			err = nil
+		}
+		srv.runErr = err
+	}()
+	select {
+	case <-ready:
+		return nil
+	case <-srv.runDone:
+		if srv.runErr != nil {
+			return srv.runErr
+		}
+		return errors.New("rpcxserver: stopped during startup")
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+
+}
+func (srv *Server) Wait() error {
+	if srv.runDone == nil {
+		return errors.New("rpcxserver: not started")
+	}
+	<-srv.runDone
+	return srv.runErr
+}
+func (srv *Server) Stop(ctx context.Context) error {
+	if srv.server == nil {
+		return nil
+	}
+	srv.shutdownOnce.Do(func() {
+		srv.runStopDone = make(chan struct{})
+		go func() {
+			defer close(srv.runStopDone)
+			defer srv.stopNonceCleanup()
+			defer func() {
+				if p := recover(); p != nil {
+					srv.runStopErr = errors.Join(srv.runStopErr, fmt.Errorf("rpcxserver stop panic: %v", p))
+				}
+			}()
+			srv.runStopErr = srv.server.Shutdown(ctx)
+			if srv.runDone != nil {
+				<-srv.runDone
+			}
+			for i := len(srv.registryStops) - 1; i >= 0; i-- {
+				srv.runStopErr = errors.Join(srv.runStopErr, srv.registryStops[i]())
+			}
+		}()
+	})
+	select {
+	case <-srv.runStopDone:
+		return srv.runStopErr
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+type readyListener struct {
+	net.Listener
+	ready chan struct{}
+	once  sync.Once
+}
+
+func (l *readyListener) Accept() (net.Conn, error) {
+	l.once.Do(func() { close(l.ready) })
+	return l.Listener.Accept()
 }

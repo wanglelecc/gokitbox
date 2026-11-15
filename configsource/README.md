@@ -1,9 +1,11 @@
-# Config 配置加载
+# ConfigSource 配置源读取与解码
 
 新应用使用 `ReadYAML` / `Document.Decode`，将应用 schema 放在应用仓库。
 
 ```go
-doc, err := config.ReadYAML("./configs/app.yaml")
+import "github.com/wanglelecc/gokitbox/configsource"
+
+doc, err := configsource.ReadYAML("./configs/app.yaml")
 if err != nil { return err }
 var opts AppConfig // 由应用定义，字段使用 yaml tags
 if err := doc.Decode(&opts); err != nil { return err }

@@ -1,4 +1,6 @@
-package config
+// Package configsource provides configuration readers, strict YAML decoding and
+// legacy section views. Application schemas and resource composition belong to callers.
+package configsource
 
 import (
 	"errors"
