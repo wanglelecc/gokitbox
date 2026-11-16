@@ -154,3 +154,7 @@ selectMode := rpcxclient.GetSelectMode()
 
 - [rpcx 官方文档](https://doc.rpcx.io/)
 - [rpcx GitHub](https://github.com/smallnest/rpcx)
+
+## 显式定点调用的包装器
+
+NewDefaultWrapWithOptions(serviceName, WrapOptions{AppId, AppKey, CallTimeout}) 为单个调用者持有凭证和超时，不初始化注册中心全局状态。可配合原生 Peer2PeerDiscovery 与 Failfast XClient 使用，由应用负责连接及 Discovery 的关闭。旧 NewDefaultWrap 的全局配置兼容行为保持不变。

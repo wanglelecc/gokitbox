@@ -2,6 +2,7 @@ package rpcxclient
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -42,7 +43,24 @@ type RpcxWrap interface {
 
 type DefaultWrap struct {
 	serviceName string
+	options     *WrapOptions
 	useNewAuth  bool // 是否使用新的 HMAC-SHA256 鉴权
+}
+
+// WrapOptions configure one direct RPCX caller without installing registry globals.
+type WrapOptions struct {
+	AppId, AppKey string
+	CallTimeout   time.Duration
+}
+
+func NewDefaultWrapWithOptions(serviceName string, o WrapOptions) (RpcxWrap, error) {
+	if (o.AppId == "") != (o.AppKey == "") {
+		return nil, errors.New("rpcxclient: appId/appKey must be paired")
+	}
+	if o.CallTimeout <= 0 {
+		return nil, errors.New("rpcxclient: callTimeout must be positive")
+	}
+	return &DefaultWrap{serviceName: serviceName, useNewAuth: true, options: &o}, nil
 }
 
 func NewDefaultWrap(serviceName string) RpcxWrap {
@@ -69,6 +87,14 @@ func (d *DefaultWrap) WrapCall(c client.XClient, ctx context.Context, serviceMet
 		}()
 	}
 
+	var authAppId, authAppKey string
+	if d.options != nil {
+		authAppId = d.options.AppId
+		authAppKey = d.options.AppKey
+	} else {
+		authAppId = appId
+		authAppKey = appKey
+	}
 	metadata := map[string]string{
 		"rpc_id":       cast.ToString(ctx.Value(CtxKeyRpcID)),
 		"trace_id":     cast.ToString(ctx.Value(CtxKeyTraceID)),
@@ -87,18 +113,18 @@ func (d *DefaultWrap) WrapCall(c client.XClient, ctx context.Context, serviceMet
 		metadata[AuthHeaderAppId] = cast.ToString(ctx.Value(CtxKeyRPCXAppId))
 		metadata[AuthHeaderTimestamp] = cast.ToString(ctx.Value(CtxKeyRPCXTimestamp))
 		metadata[AuthHeaderSign] = cast.ToString(ctx.Value(CtxKeyRPCXSign))
-	} else if appId != "" && appKey != "" {
+	} else if authAppId != "" && authAppKey != "" {
 		// 使用全局配置的鉴权
 		if d.useNewAuth {
 			// 新的 HMAC-SHA256 + nonce 鉴权
-			timestamp, nonce, sign := genRpcAuth()
-			metadata[AuthHeaderAppId] = appId
+			timestamp, nonce, sign := genRpcAuthCtx(authAppId, authAppKey)
+			metadata[AuthHeaderAppId] = authAppId
 			metadata[AuthHeaderTimestamp] = timestamp
 			metadata[AuthHeaderNonce] = nonce
 			metadata[AuthHeaderSign] = sign
 		} else {
 			// 兼容旧的 MD5 鉴权（已废弃）
-			timestamp, sign := genRpcAuthLegacy()
+			timestamp, sign := genRpcAuthCtxLegacy(authAppId, authAppKey)
 			metadata[AuthHeaderTimestamp] = timestamp
 			metadata[AuthHeaderSign] = sign
 		}
@@ -107,7 +133,7 @@ func (d *DefaultWrap) WrapCall(c client.XClient, ctx context.Context, serviceMet
 	ctx = context.WithValue(ctx, share.ReqMetaDataKey, metadata)
 
 	// 调用超时控制
-	if rpcxOptCallTimeout > 0 {
+	if d.options != nil || rpcxOptCallTimeout > 0 {
 		err = d.callWithTimeout(c, ctx, serviceMethod, args, reply)
 	} else {
 		err = c.Call(ctx, serviceMethod, args, reply)
@@ -118,8 +144,13 @@ func (d *DefaultWrap) WrapCall(c client.XClient, ctx context.Context, serviceMet
 
 // 超时控制
 func (d *DefaultWrap) callWithTimeout(c client.XClient, ctx context.Context, serviceMethod string, args interface{}, reply interface{}) error {
-	timeout := rpcxOptCallTimeout
-	if t := cast.ToString(ctx.Value(WrapClientCtxKeyCallTimeout)); t != "" {
+	var timeout time.Duration
+	if d.options != nil {
+		timeout = d.options.CallTimeout
+	} else {
+		timeout = rpcxOptCallTimeout
+	}
+	if t := cast.ToString(ctx.Value(WrapClientCtxKeyCallTimeout)); t != "" && d.options == nil {
 		if td, err := time.ParseDuration(t); err == nil && td > 0 {
 			timeout = td
 		}

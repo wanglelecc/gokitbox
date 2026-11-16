@@ -78,6 +78,7 @@ type ProxyManager struct {
 	exit  chan string
 	done  chan struct{} // 通知 Close 调用方 Run goroutine 已退出
 
+	stopping  chan struct{}
 	closeOnce sync.Once
 	grayMode  bool
 }
@@ -91,6 +92,7 @@ func NewProxyManagerWithOptions(o Options) *ProxyManager {
 
 	pm.exit = make(chan string, 1)
 	pm.done = make(chan struct{})
+	pm.stopping = make(chan struct{})
 	pm.input = make(chan []byte, bufferLimit+bufferLimit/2)
 	pm.mqMap = make(map[string]common.MQ)
 
@@ -112,7 +114,24 @@ func NewProxyManagerWithOptions(o Options) *ProxyManager {
 }
 
 // Kafka 消息投递
+var ErrProducerClosed = errors.New("producer: closed")
+
+// Kafka preserves the legacy blocking API. New callers should pass a context.
 func (m *ProxyManager) Kafka(topic string, msg []byte, key ...string) error {
+	return m.KafkaContext(context.Background(), topic, msg, key...)
+}
+
+// KafkaContext reports local queue acceptance, not broker acknowledgement.
+func (m *ProxyManager) KafkaContext(ctx context.Context, topic string, msg []byte, key ...string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	select {
+	case <-m.stopping:
+		return ErrProducerClosed
+	default:
+	}
+
 	mq := m.mqMap[meta.Kafka]
 	if mq == nil {
 		return errors.New("Kafka proxy does not exist")
@@ -141,11 +160,19 @@ func (m *ProxyManager) Kafka(topic string, msg []byte, key ...string) error {
 	line = append(line, ' ')
 	line = append(line, msg...)
 
-	mq.Input() <- line
-
-	return nil
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-m.stopping:
+		return ErrProducerClosed
+	case mq.Input() <- line:
+		return nil
+	}
 }
 func Kafka(ctx context.Context, topic string, msg []byte, key ...string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	Init()
 
 	if std == nil {
@@ -153,7 +180,7 @@ func Kafka(ctx context.Context, topic string, msg []byte, key ...string) error {
 	}
 
 	msg = appendTraceId(ctx, msg)
-	return std.Kafka(topic, msg, key...)
+	return std.KafkaContext(ctx, topic, msg, key...)
 }
 
 // Redis
@@ -212,7 +239,12 @@ func (m *ProxyManager) shutdown() {
 	close(m.done)
 }
 func (m *ProxyManager) CloseContext(ctx context.Context) error {
-	m.closeOnce.Do(func() { m.exit <- "shutdown" })
+	m.closeOnce.Do(func() {
+		if m.stopping != nil {
+			close(m.stopping)
+		}
+		m.exit <- "shutdown"
+	})
 	select {
 	case <-m.done:
 		return nil

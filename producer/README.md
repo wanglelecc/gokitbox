@@ -53,3 +53,8 @@ producer.Redis(rdsClient, "gokit_rds_list", []byte("msg context..."))
 // 延迟消息投递示例
 producer.Delay(rdsClient, "gokit_rds_delay", []byte("msg context..."), 1684627485)
 ```
+## 可取消入队
+
+包级 `Kafka(ctx, ...)` 将 context 传到 `ProxyManager.KafkaContext`；调用者等待队列时可被 deadline 或 CloseContext 停止信号解除。返回 nil 只表示本地队列接受，不代表 broker 确认。已开始的调用与关闭并发时可能刚好被队列接受；关闭后的新调用返回 ErrProducerClosed。旧 `ProxyManager.Kafka(...)` 保留签名并使用 Background，新代码应使用 KafkaContext 并设置预算。
+
+没有关闭数据 channel，不向调用者静默重试，不改变 envelope/trace_id/分区 key。满队列故障测试可用本地 fake MQ 执行；真实 broker 测试需显式启用 GOKIT_INTEGRATION_TESTS=1。

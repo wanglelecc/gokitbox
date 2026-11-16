@@ -3,7 +3,6 @@ package redisdao
 import (
 	"context"
 	"crypto/rand"
-	"errors"
 	"fmt"
 	"math/big"
 
@@ -42,22 +41,14 @@ func NewRedisNodeProviderWithClient(client *redis.Client) *RedisNodeProvider {
 func (p *RedisNodeProvider) MakeNode(ctx context.Context, project, service string) (int64, error) {
 	key := fmt.Sprintf("%s_%s", p.keyPrefix, project)
 
-	// 获取当前 score
-	score, err := p.client.ZScore(ctx, key, service).Result()
-	if err != nil && !errors.Is(err, redis.Nil) {
-		return 0, fmt.Errorf("获取节点号失败: %w", err)
-	}
-	if errors.Is(err, redis.Nil) {
-		score = 0
-	}
-
-	// 自增
-	_, err = p.client.ZIncrBy(ctx, key, 1, service).Result()
+	// Use the result of the atomic increment. A separate ZScore followed by
+	// ZIncrBy lets concurrent Gateway processes receive the same node number.
+	score, err := p.client.ZIncrBy(ctx, key, 1, service).Result()
 	if err != nil {
-		return 0, fmt.Errorf("自增节点号失败: %w", err)
+		return 0, fmt.Errorf("分配节点号失败: %w", err)
 	}
-
-	return int64(score), nil
+	// Preserve the existing zero-based allocation sequence.
+	return int64(score) - 1, nil
 }
 
 // RandNode Redis 不可用时返回随机节点（兜底）
