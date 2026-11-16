@@ -4,18 +4,16 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/wanglelecc/gokitbox/logger"
-
 	"github.com/redis/go-redis/v9"
-	"github.com/spf13/cast"
+	"github.com/wanglelecc/gokitbox/logger"
 )
 
 type RedisConsumer struct {
+	runtime   *consumerRuntime
 	stopOnce  sync.Once
 	closeDone chan struct{}
 	closeErr  error
@@ -37,12 +35,24 @@ type RedisConsumer struct {
 }
 
 func NewRedisConsumer(configs []*RedisConfig, callback ConsumeCallback, alertMgr *AlertManager) (consumer *RedisConsumer, err error) {
+	return NewRedisConsumerWithContext(configs, adaptCallback(callback), RuntimeOptions{}, alertMgr)
+}
+func NewRedisConsumerWithContext(configs []*RedisConfig, callback ContextConsumeCallback, options RuntimeOptions, alertMgr *AlertManager) (consumer *RedisConsumer, err error) {
+	cfg := (&Configure{Enabled: &ConsumeEnabled{Redis: true}, Redis: configs, Runtime: options}).Snapshot()
+	if callback == nil {
+		return nil, errors.New("worker: callback is required")
+	}
+	if validationErr := cfg.Validate(); validationErr != nil {
+		return nil, validationErr
+	}
+	configs = cfg.Redis
+
 	if len(configs) == 0 {
 		err = errors.New("redis config not found")
 		return
 	}
 	consumer = new(RedisConsumer)
-	consumer.callback = callback
+	consumer.runtime = newRuntime(options, callback)
 	consumer.alertMgr = alertMgr
 	consumer.quit = make(chan struct{})
 	consumer.wg = new(sync.WaitGroup)
@@ -52,16 +62,21 @@ func NewRedisConsumer(configs []*RedisConfig, callback ConsumeCallback, alertMgr
 	go consumer.count()
 
 	// 按 addr+username+password+db 复用 redis.Client，避免相同地址创建多个独立连接池
-	clientCache := make(map[string]*redis.Client)
+	clientCache := make(map[redisConnection]*redis.Client)
 	for _, config := range configs {
-		cacheKey := fmt.Sprintf("%s|%s|%s|%d", config.Addr, config.Username, config.Password, config.Db)
+		cacheKey := redisConnection{config.Addr, config.Username, config.Password, config.Db}
 		client, ok := clientCache[cacheKey]
 		if !ok {
 			client = redis.NewClient(&redis.Options{
-				Addr:     config.Addr,
-				Username: config.Username,
-				Password: config.Password,
-				DB:       config.Db,
+				Addr:                  config.Addr,
+				Username:              config.Username,
+				Password:              config.Password,
+				DB:                    config.Db,
+				ReadTimeout:           options.defaults().OperationTimeout,
+				WriteTimeout:          options.defaults().OperationTimeout,
+				ContextTimeoutEnabled: true,
+				DialTimeout:           options.defaults().OperationTimeout,
+				MaxRetries:            -1,
 			})
 			clientCache[cacheKey] = client
 			consumer.clients = append(consumer.clients, client) // 只记录唯一 client，用于 Close
@@ -104,7 +119,7 @@ func (r *RedisConsumer) consume(client *redis.Client, config *RedisConfig) {
 	atomic.AddInt32(&r.activeGoroutines, 1)
 	defer atomic.AddInt32(&r.activeGoroutines, -1)
 
-	ctx := context.Background()
+	ctx := r.runtime.context()
 	bo := newBackoff(time.Second, 30*time.Second)
 
 	for {
@@ -139,108 +154,66 @@ func (r *RedisConsumer) consume(client *redis.Client, config *RedisConfig) {
 // 返回 true 表示收到 quit 信号，正常退出；false 表示异常，外层需重启
 func (r *RedisConsumer) doConsume(ctx context.Context, client *redis.Client, config *RedisConfig, bo *backoff) (exitClean bool) {
 	defer func() {
-		if rec := recover(); rec != nil {
+		if p := recover(); p != nil {
 			atomic.AddInt64(&r.panicCount, 1)
-			var msg string
-			if err, ok := rec.(error); ok {
-				msg = err.Error()
-				logger.Ex(ctx, "IRedisPanicRecover", fmt.Sprintf("panic recovered: %v\nstack:%v", msg, cast.ToString(debug.Stack())))
-			} else {
-				msg = fmt.Sprintf("%v", rec)
-				logger.Ex(ctx, "IRedisPanicRecover", fmt.Sprintf("panic recovered: %v\nstack:%v", msg, cast.ToString(debug.Stack())))
-			}
-			r.alertMgr.Emit(AlertEvent{
-				Component: ComponentRedis,
-				Name:      config.Queue,
-				Type:      AlertPanic,
-				Message:   msg,
-			})
+			r.alertMgr.Emit(AlertEvent{Component: ComponentRedis, Name: config.Queue, Type: AlertPanic, Message: fmt.Sprintf("consumer panic (%T)", p)})
+			logger.Ex(ctx, "RedisConsume", "consumer panic", "type", fmt.Sprintf("%T", p))
 			exitClean = false
 		}
 	}()
-
-	bo.Reset()
-	logger.Ix(ctx, "RedisConsume", fmt.Sprintf("Start consume from redis %v:%v", config.Addr, config.Queue))
-
-	delay := 0
-	t := time.NewTicker(time.Second * 300)
-	defer t.Stop()
-
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
 	for {
-		select {
-		case <-r.quit:
-			logger.Wx(ctx, "RedisConsume", "IREDIS_RECV_QUIT")
+		if stopRequested(ctx, r.quit) {
 			return true
-		case <-t.C:
-			queueLen := client.LLen(ctx, config.Queue).Val()
-			if queueLen > 2000 {
-				logger.Wx(ctx, "RedisConsumePileUp", "redis queue pile up", "queue", config.Queue, "len", queueLen)
-				r.alertMgr.Emit(AlertEvent{
-					Component: ComponentRedis,
-					Name:      config.Queue,
-					Type:      AlertQueueBacklog,
-					Message:   fmt.Sprintf("queue backlog %d > 2000", queueLen),
-				})
+		}
+		select {
+		case <-ticker.C:
+			checkCtx, stop := boundedContext(ctx, r.runtime.opts().OperationTimeout)
+			length, err := client.LLen(checkCtx, config.Queue).Result()
+			stop()
+			if err != nil {
+				logger.Wx(ctx, "RedisConsume", "backlog check failed", "queue", config.Queue, "error", err)
+			} else if length > 2000 {
+				r.alertMgr.Emit(AlertEvent{Component: ComponentRedis, Name: config.Queue, Type: AlertQueueBacklog, Message: fmt.Sprintf("queue backlog %d > 2000", length)})
 			}
 		default:
-			values, err := client.BLPop(ctx, time.Second, config.Queue).Result()
-			if err == redis.Nil {
-				delay++
-			} else if err != nil {
-				delay++
-				logger.Ex(ctx, "RedisConsume", "redis cmd exec error", "error", err.Error())
-			} else {
-				delay = 0
-
-				fLen := len(values) / 2
-				for i := 0; i < fLen; i++ {
-					value := values[2*i+1]
-
-					count := 0
-					for {
-						ret := r.callback(config.TplName, config.Queue, []byte(value))
-						if ret {
-							atomic.AddInt64(&r.successCount, int64(1))
-							logger.Dx(ctx, "RedisConsume", fmt.Sprintf("return_true:KEY:%s,VAL:%s", string(config.Queue), string(value)))
-							break
-						} else {
-							if count >= config.FailCount {
-								atomic.AddInt64(&r.errorCount, int64(1))
-								if config.FailQueue != "" {
-									if err := client.RPush(ctx, config.FailQueue, value).Err(); err != nil {
-										logger.Ex(ctx, "RedisConsume", fmt.Sprintf("send to fail queue error: %v, KEY:%s,VAL:%s", err, config.Queue, value))
-									} else {
-										logger.Dx(ctx, "RedisConsume", fmt.Sprintf("Send to Fail queue :KEY:%s,VAL:%s", string(config.Queue), string(value)))
-									}
-								} else {
-									logger.Ex(ctx, "RedisConsume", fmt.Sprintf("Fail queue is empty:KEY:%s,VAL:%s", string(config.Queue), string(value)))
-									r.alertMgr.Emit(AlertEvent{
-										Component: ComponentRedis,
-										Name:      config.Queue,
-										Type:      AlertMsgDiscard,
-										Message:   fmt.Sprintf("no fail queue configured, discarding after %d retries", config.FailCount),
-									})
-								}
-								break
-							}
-							count++
-						}
-					}
-				}
-			}
 		}
 
-		if delay > 0 {
-			if delay > 5 {
-				delay = 5
-			}
-			// H-1: 用 select 替代 time.Sleep，quit 信号能立即打断等待
-			select {
-			case <-r.quit:
+		operation, cancel := boundedContext(ctx, r.runtime.opts().OperationTimeout)
+		values, err := client.BLPop(operation, time.Second, config.Queue).Result()
+		cancel()
+		if err == redis.Nil {
+			if !waitRetry(ctx, r.quit, 100*time.Millisecond) {
 				return true
-			case <-time.After(time.Duration(delay*100) * time.Millisecond):
 			}
+			continue
 		}
+		if err != nil {
+			logger.Wx(ctx, "RedisConsume", "pop failed", "error", err)
+			return stopRequested(ctx, r.quit)
+		}
+		if len(values) != 2 {
+			logger.Wx(ctx, "RedisConsume", "invalid BLPOP response")
+			return false
+		}
+		value := values[1]
+		var forward func(context.Context) error
+		if config.FailQueue != "" {
+			forward = func(operation context.Context) error { return client.RPush(operation, config.FailQueue, value).Err() }
+		}
+		restore := func(operation context.Context) error { return client.RPush(operation, config.Queue, value).Err() }
+		resolved, err := r.runtime.processLegacy(ctx, r.quit, r.callback, config.TplName, config.Queue, []byte(value), config.FailCount, &r.successCount, &r.errorCount, forward, restore, func() {
+			r.alertMgr.Emit(AlertEvent{Component: ComponentRedis, Name: config.Queue, Type: AlertMsgDiscard, Message: "no failure queue; retry limit reached"})
+		})
+		if err != nil {
+			r.runtime.recordError(err)
+			logger.Ex(ctx, "RedisConsume", "message restore failed", "queue", config.Queue, "error", err)
+		}
+		if !resolved {
+			return stopRequested(ctx, r.quit)
+		}
+		bo.Reset()
 	}
 }
 
@@ -262,7 +235,13 @@ func (r *RedisConsumer) CloseContext(ctx context.Context) error {
 		close(r.quit)
 		go func() {
 			defer close(r.closeDone)
+			stopCancellation := r.runtime.cancelOnDeadline(ctx)
+			defer stopCancellation()
+			if r.runtime != nil {
+				defer r.runtime.cancel()
+			}
 			r.wg.Wait()
+			r.closeErr = errors.Join(r.closeErr, r.runtime.drainError())
 			for _, client := range r.clients {
 				if err := client.Close(); err != nil {
 					r.closeErr = errors.Join(r.closeErr, err)

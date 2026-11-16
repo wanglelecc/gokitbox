@@ -4,18 +4,16 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/wanglelecc/gokitbox/logger"
-
 	"github.com/redis/go-redis/v9"
-	"github.com/spf13/cast"
+	"github.com/wanglelecc/gokitbox/logger"
 )
 
 type DelayConsumer struct {
+	runtime   *consumerRuntime
 	stopOnce  sync.Once
 	closeDone chan struct{}
 	closeErr  error
@@ -37,12 +35,24 @@ type DelayConsumer struct {
 }
 
 func NewDelayConsumer(configs []*DelayConfig, callback ConsumeCallback, alertMgr *AlertManager) (consumer *DelayConsumer, err error) {
+	return NewDelayConsumerWithContext(configs, adaptCallback(callback), RuntimeOptions{}, alertMgr)
+}
+func NewDelayConsumerWithContext(configs []*DelayConfig, callback ContextConsumeCallback, options RuntimeOptions, alertMgr *AlertManager) (consumer *DelayConsumer, err error) {
+	cfg := (&Configure{Enabled: &ConsumeEnabled{Delay: true}, Delay: configs, Runtime: options}).Snapshot()
+	if callback == nil {
+		return nil, errors.New("worker: callback is required")
+	}
+	if validationErr := cfg.Validate(); validationErr != nil {
+		return nil, validationErr
+	}
+	configs = cfg.Delay
+
 	if len(configs) == 0 {
 		err = errors.New("delay config not found")
 		return
 	}
 	consumer = new(DelayConsumer)
-	consumer.callback = callback
+	consumer.runtime = newRuntime(options, callback)
 	consumer.alertMgr = alertMgr
 	consumer.quit = make(chan struct{})
 	consumer.wg = new(sync.WaitGroup)
@@ -52,16 +62,21 @@ func NewDelayConsumer(configs []*DelayConfig, callback ConsumeCallback, alertMgr
 	go consumer.count()
 
 	// 按 addr+username+password+db 复用 redis.Client，避免相同地址创建多个独立连接池
-	clientCache := make(map[string]*redis.Client)
+	clientCache := make(map[redisConnection]*redis.Client)
 	for _, config := range configs {
-		cacheKey := fmt.Sprintf("%s|%s|%s|%d", config.Addr, config.Username, config.Password, config.Db)
+		cacheKey := redisConnection{config.Addr, config.Username, config.Password, config.Db}
 		client, ok := clientCache[cacheKey]
 		if !ok {
 			client = redis.NewClient(&redis.Options{
-				Addr:     config.Addr,
-				Username: config.Username,
-				Password: config.Password,
-				DB:       config.Db,
+				Addr:                  config.Addr,
+				Username:              config.Username,
+				Password:              config.Password,
+				DB:                    config.Db,
+				ReadTimeout:           options.defaults().OperationTimeout,
+				WriteTimeout:          options.defaults().OperationTimeout,
+				ContextTimeoutEnabled: true,
+				DialTimeout:           options.defaults().OperationTimeout,
+				MaxRetries:            -1,
 			})
 			clientCache[cacheKey] = client
 			consumer.clients = append(consumer.clients, client) // 只记录唯一 client，用于 Close
@@ -104,7 +119,7 @@ func (d *DelayConsumer) consume(client *redis.Client, config *DelayConfig) {
 	atomic.AddInt32(&d.activeGoroutines, 1)
 	defer atomic.AddInt32(&d.activeGoroutines, -1)
 
-	ctx := context.Background()
+	ctx := d.runtime.context()
 	bo := newBackoff(time.Second, 30*time.Second)
 
 	for {
@@ -139,132 +154,78 @@ func (d *DelayConsumer) consume(client *redis.Client, config *DelayConfig) {
 // 返回 true 表示收到 quit 信号，正常退出；false 表示异常，外层需重启
 func (d *DelayConsumer) doConsume(ctx context.Context, client *redis.Client, config *DelayConfig, bo *backoff) (exitClean bool) {
 	defer func() {
-		if rec := recover(); rec != nil {
+		if p := recover(); p != nil {
 			atomic.AddInt64(&d.panicCount, 1)
-			var msg string
-			if err, ok := rec.(error); ok {
-				msg = err.Error()
-				logger.Ex(ctx, "IDelayPanicRecover", fmt.Sprintf("panic recovered: %v\nstack:%v", msg, cast.ToString(debug.Stack())))
-			} else {
-				msg = fmt.Sprintf("%v", rec)
-				logger.Ex(ctx, "IDelayPanicRecover", fmt.Sprintf("panic recovered: %v\nstack:%v", msg, cast.ToString(debug.Stack())))
-			}
-			d.alertMgr.Emit(AlertEvent{
-				Component: ComponentDelay,
-				Name:      config.Queue,
-				Type:      AlertPanic,
-				Message:   msg,
-			})
+			d.alertMgr.Emit(AlertEvent{Component: ComponentDelay, Name: config.Queue, Type: AlertPanic, Message: fmt.Sprintf("consumer panic (%T)", p)})
+			logger.Ex(ctx, "DelayConsume", "consumer panic", "type", fmt.Sprintf("%T", p))
 			exitClean = false
 		}
 	}()
-
-	bo.Reset()
-	logger.Ix(ctx, "DelayConsume", fmt.Sprintf("Start consume from delay %v:%v", config.Addr, config.Queue))
-
-	delay := 0
-	t := time.NewTicker(time.Second * 300)
-	defer t.Stop()
-
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
 	for {
-		select {
-		case <-d.quit:
-			logger.Wx(ctx, "DelayConsume", "IDELAY_RECV_QUIT")
+		if stopRequested(ctx, d.quit) {
 			return true
-		case <-t.C:
-			queueLen := client.ZCount(ctx, config.Queue, "1", cast.ToString(time.Now().Unix())).Val()
-			if queueLen > 2000 {
-				logger.Wx(ctx, "DelayConsumePileUp", "Delay queue pile up", "queue", config.Queue, "len", queueLen)
-				d.alertMgr.Emit(AlertEvent{
-					Component: ComponentDelay,
-					Name:      config.Queue,
-					Type:      AlertQueueBacklog,
-					Message:   fmt.Sprintf("delay queue backlog %d > 2000", queueLen),
-				})
+		}
+		select {
+		case <-ticker.C:
+			checkCtx, stop := boundedContext(ctx, d.runtime.opts().OperationTimeout)
+			length, err := client.ZCount(checkCtx, config.Queue, "-inf", fmt.Sprint(time.Now().Unix())).Result()
+			stop()
+			if err != nil {
+				logger.Wx(ctx, "DelayConsume", "backlog check failed", "queue", config.Queue, "error", err)
+			} else if length > 2000 {
+				d.alertMgr.Emit(AlertEvent{Component: ComponentDelay, Name: config.Queue, Type: AlertQueueBacklog, Message: fmt.Sprintf("queue backlog %d > 2000", length)})
 			}
 		default:
-			member, err := d.pop(ctx, client, config.Queue, time.Now().Unix())
-			if errors.Is(err, redis.Nil) {
-				delay++
-			} else if err != nil {
-				delay++
-				logger.Ex(ctx, "DelayConsume", "redis cmd exec error", "error", err.Error())
-			} else {
-				delay = 0
-				count := 0
-				for {
-					ret := d.callback(config.TplName, config.Queue, []byte(member))
-					if ret {
-						atomic.AddInt64(&d.successCount, int64(1))
-						logger.Dx(ctx, "DelayConsume", fmt.Sprintf("return_true:KEY:%s,VAL:%s", string(config.Queue), member))
-						break
-					} else {
-						if count >= config.FailCount {
-							atomic.AddInt64(&d.errorCount, int64(1))
-							if config.FailQueue != "" {
-								failZ := redis.Z{Score: float64(time.Now().Unix()), Member: member}
-								if err := client.ZAdd(ctx, config.FailQueue, failZ).Err(); err != nil {
-									logger.Ex(ctx, "DelayConsume", fmt.Sprintf("send to fail queue error: %v, KEY:%s,VAL:%s", err, config.Queue, member))
-								} else {
-									logger.Dx(ctx, "DelayConsume", fmt.Sprintf("Send to Fail queue :KEY:%s,VAL:%s", string(config.Queue), member))
-								}
-							} else {
-								logger.Ex(ctx, "DelayConsume", fmt.Sprintf("Fail queue is empty:KEY:%s,VAL:%s", string(config.Queue), member))
-								d.alertMgr.Emit(AlertEvent{
-									Component: ComponentDelay,
-									Name:      config.Queue,
-									Type:      AlertMsgDiscard,
-									Message:   fmt.Sprintf("no fail queue configured, discarding after %d retries", config.FailCount),
-								})
-							}
-							break
-						}
-						count++
-					}
-				}
-			}
 		}
 
-		if delay > 0 {
-			if delay > 5 {
-				delay = 5
-			}
-			// H-1: 用 select 替代 time.Sleep，quit 信号能立即打断等待
-			select {
-			case <-d.quit:
+		operation, cancel := boundedContext(ctx, d.runtime.opts().OperationTimeout)
+		value, err := d.pop(operation, client, config.Queue, time.Now().Unix())
+		cancel()
+		if errors.Is(err, redis.Nil) {
+			if !waitRetry(ctx, d.quit, 100*time.Millisecond) {
 				return true
-			case <-time.After(time.Duration(delay*100) * time.Millisecond):
+			}
+			continue
+		}
+		if err != nil {
+			logger.Wx(ctx, "DelayConsume", "pop failed", "error", err)
+			return stopRequested(ctx, d.quit)
+		}
+		var forward func(context.Context) error
+		if config.FailQueue != "" {
+			forward = func(operation context.Context) error {
+				return client.ZAdd(operation, config.FailQueue, redis.Z{Score: float64(time.Now().Unix()), Member: value}).Err()
 			}
 		}
+		restore := func(operation context.Context) error {
+			return client.ZAddNX(operation, config.Queue, redis.Z{Score: float64(time.Now().Unix()), Member: value}).Err()
+		}
+		resolved, err := d.runtime.processLegacy(ctx, d.quit, d.callback, config.TplName, config.Queue, []byte(value), config.FailCount, &d.successCount, &d.errorCount, forward, restore, func() {
+			d.alertMgr.Emit(AlertEvent{Component: ComponentDelay, Name: config.Queue, Type: AlertMsgDiscard, Message: "no failure queue; retry limit reached"})
+		})
+		if err != nil {
+			d.runtime.recordError(err)
+			logger.Ex(ctx, "DelayConsume", "message restore failed", "queue", config.Queue, "error", err)
+		}
+		if !resolved {
+			return stopRequested(ctx, d.quit)
+		}
+		bo.Reset()
 	}
 }
 
-// pop 从延迟 ZSet 中弹出一个已到期（score ≤ nowUnix）的成员。
-//
-// 实现说明：
-//   - ZPopMin 是 Redis 原子命令，并发调用不会返回同一元素，无重复消费问题。
-//   - 弹出后校验分值：未到期则 ZAdd 回写，对 Redis Cluster / 代理完全兼容。
-//   - 去掉 ZCount 预检，减少一次 RTT；ZPopMin 返回空即无到期元素。
-func (d *DelayConsumer) pop(ctx context.Context, client *redis.Client, queue string, nowUnix int64) (member string, err error) {
-	vs, err := client.ZPopMin(ctx, queue, 1).Result()
-	if err != nil {
-		return "", err
-	}
-	if len(vs) == 0 {
-		return "", redis.Nil
-	}
+// duePopScript leaves future members untouched. The due check and delete are
+// one single-key operation, including on Redis Cluster.
+const duePopScript = `
+local item=redis.call('ZRANGE',KEYS[1],0,0,'WITHSCORES')
+if #item==0 or tonumber(item[2])>tonumber(ARGV[1]) then return false end
+redis.call('ZREM',KEYS[1],item[1])
+return item[1]`
 
-	v := vs[0]
-	if cast.ToInt64(v.Score) > nowUnix {
-		// 最小分值元素尚未到期，回写后告知调用方无可消费元素
-		if putErr := client.ZAdd(ctx, queue, v).Err(); putErr != nil {
-			// 回写失败仍返回 Nil，该元素丢失风险由日志告警；不提前消费
-			logger.Ex(ctx, "DelayPop", fmt.Sprintf("ZAdd back failed: %v, member may be lost: %v", putErr, v.Member))
-		}
-		return "", redis.Nil
-	}
-
-	return cast.ToString(v.Member), nil
+func (d *DelayConsumer) pop(ctx context.Context, client *redis.Client, queue string, nowUnix int64) (string, error) {
+	return client.Eval(ctx, duePopScript, []string{queue}, nowUnix).Text()
 }
 
 // CloseWithTimeout 带超时的优雅关闭
@@ -285,7 +246,13 @@ func (d *DelayConsumer) CloseContext(ctx context.Context) error {
 		close(d.quit)
 		go func() {
 			defer close(d.closeDone)
+			stopCancellation := d.runtime.cancelOnDeadline(ctx)
+			defer stopCancellation()
+			if d.runtime != nil {
+				defer d.runtime.cancel()
+			}
 			d.wg.Wait()
+			d.closeErr = errors.Join(d.closeErr, d.runtime.drainError())
 			for _, client := range d.clients {
 				if err := client.Close(); err != nil {
 					d.closeErr = errors.Join(d.closeErr, err)

@@ -2,9 +2,10 @@ package consumer
 
 import (
 	"fmt"
-	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
 	"sort"
 	"strings"
+
+	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
 )
 
 // Each failure producer belongs to a connection identity, never to the first
@@ -56,8 +57,8 @@ func createFailureProducers(configs []*KafkaConfig, create func(*KafkaConfig) (k
 }
 func kafkaProducerOptions(cfg *KafkaConfig) *kafka.ConfigMap {
 	options := &kafka.ConfigMap{
-		"bootstrap.servers": strings.Join(cfg.Host, ","), "api.version.request": "true", "message.max.bytes": 1000000,
-		"linger.ms": 500, "sticky.partitioning.linger.ms": 1000, "retries": INT32_MAX, "retry.backoff.ms": 1000, "reconnect.backoff.max.ms": 3000, "acks": "1",
+		"bootstrap.servers": strings.Join(cfg.Host, ","), "message.max.bytes": 1000000,
+		"linger.ms": 500, "sticky.partitioning.linger.ms": 1000, "retries": INT32_MAX, "retry.backoff.ms": 1000, "reconnect.backoff.max.ms": 3000, "acks": "all", "enable.idempotence": true,
 		"security.protocol": "plaintext",
 	}
 	if cfg.SASL != nil && cfg.SASL.Enabled {
@@ -68,3 +69,27 @@ func kafkaProducerOptions(cfg *KafkaConfig) *kafka.ConfigMap {
 	}
 	return options
 }
+
+// librdkafka counts queued application events in Producer.Len/Flush, including
+// connection errors. Drain them continuously so a recovered outage does not
+// leave Flush reporting undelivered messages forever. Per-message delivery
+// reports still go to the private channel supplied to Produce.
+type nativeFailureProducer struct {
+	producer   *kafka.Producer
+	eventsDone chan struct{}
+}
+
+func ownFailureProducer(producer *kafka.Producer) kafkaFailureProducer {
+	owner := &nativeFailureProducer{producer: producer, eventsDone: make(chan struct{})}
+	go func() {
+		defer close(owner.eventsDone)
+		for range producer.Events() {
+		}
+	}()
+	return owner
+}
+func (p *nativeFailureProducer) Produce(message *kafka.Message, delivery chan kafka.Event) error {
+	return p.producer.Produce(message, delivery)
+}
+func (p *nativeFailureProducer) Flush(timeout int) int { return p.producer.Flush(timeout) }
+func (p *nativeFailureProducer) Close()                { p.producer.Close(); <-p.eventsDone }

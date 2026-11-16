@@ -4,21 +4,20 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/spf13/cast"
-	"github.com/wanglelecc/gokitbox/logger"
-
 	amqp "github.com/rabbitmq/amqp091-go"
+	"github.com/wanglelecc/gokitbox/logger"
 )
 
 type RabbitmqConsumer struct {
-	stopOnce  sync.Once
-	closeDone chan struct{}
-	closeErr  error
+	runtime        *consumerRuntime
+	sessionFactory func(context.Context, *RabbitmqConfig) (rabbitSession, error)
+	stopOnce       sync.Once
+	closeDone      chan struct{}
+	closeErr       error
 
 	quit     chan struct{}
 	callback ConsumeCallback
@@ -35,12 +34,24 @@ type RabbitmqConsumer struct {
 }
 
 func NewRabbitmqConsumer(configs []*RabbitmqConfig, callback ConsumeCallback, alertMgr *AlertManager) (*RabbitmqConsumer, error) {
+	return NewRabbitmqConsumerWithContext(configs, adaptCallback(callback), RuntimeOptions{}, alertMgr)
+}
+func NewRabbitmqConsumerWithContext(configs []*RabbitmqConfig, callback ContextConsumeCallback, options RuntimeOptions, alertMgr *AlertManager) (*RabbitmqConsumer, error) {
+	cfg := (&Configure{Enabled: &ConsumeEnabled{Rabbitmq: true}, Rabbitmq: configs, Runtime: options}).Snapshot()
+	if callback == nil {
+		return nil, errors.New("worker: callback is required")
+	}
+	if validationErr := cfg.Validate(); validationErr != nil {
+		return nil, validationErr
+	}
+	configs = cfg.Rabbitmq
+
 	if len(configs) == 0 {
 		return nil, errors.New("rabbitmq config not found")
 	}
 
 	consumer := &RabbitmqConsumer{
-		callback: callback,
+		runtime:  newRuntime(options, callback),
 		quit:     make(chan struct{}),
 		wg:       new(sync.WaitGroup),
 		configs:  configs,
@@ -75,7 +86,13 @@ func (r *RabbitmqConsumer) CloseContext(ctx context.Context) error {
 		close(r.quit)
 		go func() {
 			defer close(r.closeDone)
+			stopCancellation := r.runtime.cancelOnDeadline(ctx)
+			defer stopCancellation()
+			if r.runtime != nil {
+				defer r.runtime.cancel()
+			}
 			r.wg.Wait()
+			r.closeErr = errors.Join(r.closeErr, r.runtime.drainError())
 		}()
 	})
 	select {
@@ -91,262 +108,121 @@ func (r *RabbitmqConsumer) Close() {
 	r.CloseWithTimeout(10 * time.Second)
 }
 
-// dial 建立独立连接、channel 并注册消费者，每个 goroutine 独享，不跨 goroutine 共享
-func (r *RabbitmqConsumer) dial(config *RabbitmqConfig) (*amqp.Connection, *amqp.Channel, <-chan amqp.Delivery, error) {
-	conn, err := amqp.Dial(config.URL)
-	if err != nil {
-		return nil, nil, nil, fmt.Errorf("dial: %w", err)
-	}
-
-	channel, err := conn.Channel()
-	if err != nil {
-		conn.Close()
-		return nil, nil, nil, fmt.Errorf("open channel: %w", err)
-	}
-
-	if err = channel.Qos(config.PrefetchCount, 0, false); err != nil {
-		channel.Close()
-		conn.Close()
-		return nil, nil, nil, fmt.Errorf("set qos: %w", err)
-	}
-
-	msgs, err := channel.Consume(
-		config.ConsumerQueue,
-		"",
-		false, false, false, false, nil,
-	)
-	if err != nil {
-		channel.Close()
-		conn.Close()
-		return nil, nil, nil, fmt.Errorf("consume: %w", err)
-	}
-
-	return conn, channel, msgs, nil
+// Each goroutine owns a complete AMQP session. A failed or uncertain publish
+// closes that session with the source delivery unacknowledged for redelivery.
+type rabbitSession interface {
+	deliveries() <-chan amqp.Delivery
+	transferFailure(context.Context, string, amqp.Delivery) error
+	settle(context.Context, amqp.Delivery, bool, bool) error
+	Close() error
 }
 
-// consume 外层自愈循环：连接断开后按指数退避重连，panic 后同样重启
 func (r *RabbitmqConsumer) consume(config *RabbitmqConfig, idx int) {
 	defer r.wg.Done()
 	atomic.AddInt32(&r.activeGoroutines, 1)
 	defer atomic.AddInt32(&r.activeGoroutines, -1)
-
-	ctx := context.Background()
-	tag := fmt.Sprintf("RabbitmqConsumer-%d", idx)
+	ctx := r.runtime.context()
 	bo := newBackoff(time.Second, 30*time.Second)
-
-	for {
-		select {
-		case <-r.quit:
-			return
-		default:
-		}
-
-		if exitClean := r.doConsume(ctx, tag, config, bo); exitClean {
+	for !stopRequested(ctx, r.quit) {
+		if r.doConsume(ctx, fmt.Sprintf("rabbitmq-%d", idx), config, bo) {
 			return
 		}
-
 		atomic.AddInt64(&r.restartCount, 1)
-		wait := bo.Next()
-		logger.Wx(ctx, tag, fmt.Sprintf("reconnecting in %v", wait))
-		r.alertMgr.Emit(AlertEvent{
-			Component: ComponentRabbitmq,
-			Name:      config.ConsumerQueue,
-			Type:      AlertRestart,
-			Message:   fmt.Sprintf("consumer goroutine restarting in %v", wait),
-		})
-		select {
-		case <-r.quit:
+		delay := bo.Next()
+		r.alertMgr.Emit(AlertEvent{Component: ComponentRabbitmq, Name: config.ConsumerQueue, Type: AlertRestart, Message: fmt.Sprintf("restarting in %v", delay)})
+		if !waitRetry(ctx, r.quit, delay) {
 			return
-		case <-time.After(wait):
 		}
 	}
 }
-
-// doConsume 单次连接生命周期：dial → consumeLoop → 返回
-// 返回 true 表示收到 quit 信号，正常退出；false 表示连接断开或 panic，外层需重连
-func (r *RabbitmqConsumer) doConsume(ctx context.Context, tag string, config *RabbitmqConfig, bo *backoff) (exitClean bool) {
+func (r *RabbitmqConsumer) doConsume(ctx context.Context, tag string, config *RabbitmqConfig, bo *backoff) (clean bool) {
 	defer func() {
-		if rec := recover(); rec != nil {
+		if p := recover(); p != nil {
 			atomic.AddInt64(&r.panicCount, 1)
-			var msg string
-			if err, ok := rec.(error); ok {
-				msg = err.Error()
-				logger.Ex(ctx, "RabbitmqConsumerPanicRecover", fmt.Sprintf("panic recovered: %v\nstack:%v", msg, cast.ToString(debug.Stack())))
-			} else {
-				msg = fmt.Sprintf("%v", rec)
-				logger.Ex(ctx, "RabbitmqConsumerPanicRecover", fmt.Sprintf("panic recovered: %v\nstack:%v", msg, cast.ToString(debug.Stack())))
-			}
-			r.alertMgr.Emit(AlertEvent{
-				Component: ComponentRabbitmq,
-				Name:      config.ConsumerQueue,
-				Type:      AlertPanic,
-				Message:   msg,
-			})
-			exitClean = false
+			r.alertMgr.Emit(AlertEvent{Component: ComponentRabbitmq, Name: config.ConsumerQueue, Type: AlertPanic, Message: fmt.Sprintf("consumer panic (%T)", p)})
+			logger.Ex(ctx, tag, "consumer panic", "type", fmt.Sprintf("%T", p))
+			clean = false
 		}
 	}()
-
-	conn, channel, msgs, err := r.dial(config)
+	var session rabbitSession
+	var err error
+	if r.sessionFactory != nil {
+		session, err = r.sessionFactory(ctx, config)
+	} else {
+		session, err = openRabbitSession(ctx, config, r.runtime.opts())
+	}
 	if err != nil {
-		logger.Ex(ctx, tag, fmt.Sprintf("dial error: %v", err))
-		r.alertMgr.Emit(AlertEvent{
-			Component: ComponentRabbitmq,
-			Name:      config.ConsumerQueue,
-			Type:      AlertConnLost,
-			Message:   "dial rabbitmq failed",
-			Err:       err,
-		})
-		return false
+		logger.Wx(ctx, tag, "connect failed", "error", err)
+		r.alertMgr.Emit(AlertEvent{Component: ComponentRabbitmq, Name: config.ConsumerQueue, Type: AlertConnLost, Message: "connect failed", Err: err})
+		return stopRequested(ctx, r.quit)
 	}
-
-	// 连接成功，重置退避
-	bo.Reset()
-	logger.Ix(ctx, tag, fmt.Sprintf("connected, queue: %s", config.ConsumerQueue))
-	r.alertMgr.Emit(AlertEvent{
-		Component: ComponentRabbitmq,
-		Name:      config.ConsumerQueue,
-		Type:      AlertConnRestored,
-		Message:   "connected to rabbitmq",
-	})
-
-	return r.consumeLoop(ctx, tag, config, conn, channel, msgs)
-}
-
-// consumeLoop 消息消费主循环，conn 断开或收到 quit 时返回，defer 保证连接清理
-func (r *RabbitmqConsumer) consumeLoop(
-	ctx context.Context,
-	tag string,
-	config *RabbitmqConfig,
-	conn *amqp.Connection,
-	channel *amqp.Channel,
-	msgs <-chan amqp.Delivery,
-) (exitClean bool) {
-	defer conn.Close()
-	defer channel.Close()
-
+	r.alertMgr.Emit(AlertEvent{Component: ComponentRabbitmq, Name: config.ConsumerQueue, Type: AlertConnRestored, Message: "AMQP connection and subscription established"})
+	defer func() {
+		if err := session.Close(); err != nil {
+			r.runtime.recordError(err)
+			logger.Wx(ctx, tag, "close failed", "error", err)
+		}
+	}()
 	for {
-		select {
-		case <-r.quit:
-			logger.Wx(ctx, tag, "quit signal received")
+		if stopRequested(ctx, r.quit) {
 			return true
-		case event, ok := <-msgs:
-			if !ok {
-				logger.Wx(ctx, tag, "message channel closed")
-				r.alertMgr.Emit(AlertEvent{
-					Component: ComponentRabbitmq,
-					Name:      config.ConsumerQueue,
-					Type:      AlertConnLost,
-					Message:   "rabbitmq message channel closed unexpectedly",
-				})
-				return false
-			}
-			r.handleMessage(ctx, tag, config, channel, event)
 		}
-	}
-}
-
-// handleMessage 处理单条消息，含重试和失败队列逻辑
-func (r *RabbitmqConsumer) handleMessage(
-	ctx context.Context,
-	tag string,
-	config *RabbitmqConfig,
-	channel *amqp.Channel,
-	event amqp.Delivery,
-) {
-	for retryCount := 0; ; retryCount++ {
-		// H-4: 每次重试前检查关闭信号，避免业务重试阻塞优雅关闭
-		// 未 Ack 的消息在 channel 关闭后由 AMQP broker 自动重新入队
 		select {
 		case <-r.quit:
-			return
-		default:
-		}
-
-		if r.callback(config.TplName, event.RoutingKey, event.Body) {
-			logger.Dx(ctx, tag, fmt.Sprintf("processed: KEY:%s", event.RoutingKey))
-			if err := r.ackWithRetry(ctx, &event, 3); err != nil {
-				logger.Ex(ctx, tag, fmt.Sprintf("ACK failed after retries: KEY:%s", event.RoutingKey))
+			return true
+		case <-ctx.Done():
+			return true
+		case event, ok := <-session.deliveries():
+			if !ok {
+				return stopRequested(ctx, r.quit)
 			}
-			return
-		}
-
-		logger.Ex(ctx, tag, fmt.Sprintf("processing failed (attempt %d): KEY:%s", retryCount+1, event.RoutingKey))
-
-		if retryCount < config.FailCount {
-			// M-2: 避免 CPU 空转，加入退避等待；同时响应关闭信号（未 Ack 的消息由 broker 重新入队）
-			select {
-			case <-r.quit:
-				return
-			case <-time.After(100 * time.Millisecond):
+			if err := r.handleDelivery(ctx, config, session, event); err != nil {
+				logger.Wx(ctx, tag, "delivery unresolved; closing session", "error", err)
+				return stopRequested(ctx, r.quit)
 			}
-			continue
+			bo.Reset()
 		}
-
-		// 超出重试次数，进入失败处理
-		if config.FailExchange != "" {
-			published := false
-			for i := 0; i < 3; i++ {
-				err := channel.Publish(
-					config.FailExchange, event.RoutingKey, false, false,
-					amqp.Publishing{ContentType: "text/plain", Body: event.Body},
-				)
-				if err != nil {
-					logger.Ex(ctx, tag, fmt.Sprintf("publish to fail exchange (attempt %d): %v", i+1, err))
-					select {
-					case <-r.quit:
-						return
-					case <-time.After(100 * time.Millisecond):
-					}
-					continue
-				}
-				published = true
-				break
-			}
-
-			if published {
-				logger.Ix(ctx, tag, fmt.Sprintf("sent to fail exchange: %s", config.FailExchange))
-				if err := r.ackWithRetry(ctx, &event, 3); err != nil {
-					logger.Ex(ctx, tag, "ACK failed after sending to fail exchange")
-				}
-			} else {
-				logger.Ex(ctx, tag, "publish to fail exchange failed after 3 attempts, rejecting")
-				r.alertMgr.Emit(AlertEvent{
-					Component: ComponentRabbitmq,
-					Name:      config.ConsumerQueue,
-					Type:      AlertMsgDiscard,
-					Message:   fmt.Sprintf("failed to publish to fail exchange %s after 3 retries, key=%s", config.FailExchange, event.RoutingKey),
-				})
-				event.Reject(config.IsReject)
-			}
-		} else {
-			logger.Wx(ctx, tag, fmt.Sprintf("no fail exchange configured, rejecting: KEY:%s", event.RoutingKey))
-			r.alertMgr.Emit(AlertEvent{
-				Component: ComponentRabbitmq,
-				Name:      config.ConsumerQueue,
-				Type:      AlertMsgDiscard,
-				Message:   fmt.Sprintf("no fail exchange configured, discarding after %d retries, key=%s", config.FailCount, event.RoutingKey),
-			})
-			event.Reject(config.IsReject)
-		}
-
-		return
 	}
 }
-
-func (r *RabbitmqConsumer) ackWithRetry(ctx context.Context, event *amqp.Delivery, maxRetries int) error {
-	for i := 0; i < maxRetries; i++ {
-		if err := event.Ack(false); err == nil {
-			return nil
-		} else {
-			logger.Ex(ctx, "ackWithRetry", fmt.Sprintf("ACK failed (%d/%d): %v", i+1, maxRetries, err))
+func (r *RabbitmqConsumer) handleDelivery(ctx context.Context, config *RabbitmqConfig, session rabbitSession, event amqp.Delivery) error {
+	options := r.runtime.opts()
+	processed := false
+	for attempt := 0; attempt <= config.FailCount; attempt++ {
+		if stopRequested(ctx, r.quit) {
+			return context.Canceled
 		}
-		if i < maxRetries-1 {
-			select {
-			case <-r.quit:
-				return fmt.Errorf("ack interrupted by shutdown")
-			case <-time.After(100 * time.Millisecond):
-			}
+		if r.runtime.call(ctx, r.callback, config.TplName, event.RoutingKey, event.Body) {
+			processed = true
+			break
+		}
+		if attempt < config.FailCount && !waitRetry(ctx, r.quit, options.RetryDelay) {
+			return context.Canceled
 		}
 	}
-	return fmt.Errorf("ack failed after %d retries", maxRetries)
+	if !processed {
+		if stopRequested(ctx, r.quit) {
+			return context.Canceled
+		}
+		if config.FailExchange != "" {
+			deliveryCtx, cancel := boundedContext(ctx, options.DeliveryTimeout)
+			err := session.transferFailure(deliveryCtx, config.FailExchange, event)
+			cancel()
+			if err != nil {
+				return fmt.Errorf("failure exchange not confirmed/routable: %w", err)
+			}
+		} else {
+			r.alertMgr.Emit(AlertEvent{Component: ComponentRabbitmq, Name: config.ConsumerQueue, Type: AlertMsgDiscard, Message: "no failure exchange; applying configured reject/requeue policy"})
+			if config.IsReject && !waitRetry(ctx, r.quit, options.RetryDelay) {
+				return context.Canceled
+			}
+			operation, cancel := boundedContext(ctx, options.OperationTimeout)
+			defer cancel()
+			return session.settle(operation, event, true, config.IsReject)
+		}
+	}
+	operation, cancel := boundedContext(ctx, options.OperationTimeout)
+	defer cancel()
+	// Acknowledgement writes are not broker confirms. An uncertain Ack is handled
+	// by closing the session, never by blindly retrying the same delivery tag.
+	return session.settle(operation, event, false, false)
 }

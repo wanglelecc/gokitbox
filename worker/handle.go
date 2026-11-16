@@ -36,7 +36,7 @@ func GetHandle(name string) (Handle, error) {
 	handleLock.RLock()
 	defer handleLock.RUnlock()
 
-	if h, ok := handleMap[name]; ok {
+	if h, ok := handleMap[name]; ok && h != nil {
 		return h, nil
 	}
 

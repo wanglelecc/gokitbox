@@ -37,6 +37,14 @@ func NewConsumeManager(callback ConsumeCallback, alertMgr *AlertManager) *Consum
 
 // NewConsumeManagerWithConfig accepts application-owned validated configuration.
 func NewConsumeManagerWithConfig(cfg *Configure, callback ConsumeCallback, alertMgr *AlertManager) (*ConsumeManager, error) {
+	return NewConsumeManagerWithContext(cfg, adaptCallback(callback), alertMgr)
+}
+
+func NewConsumeManagerWithContext(cfg *Configure, callback ContextConsumeCallback, alertMgr *AlertManager) (*ConsumeManager, error) {
+	cfg = cfg.Snapshot()
+	if callback == nil {
+		return nil, errors.New("worker: callback is required")
+	}
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
@@ -44,31 +52,31 @@ func NewConsumeManagerWithConfig(cfg *Configure, callback ConsumeCallback, alert
 	var err error
 	fail := func(kind string) (*ConsumeManager, error) {
 		manager.Close()
-		return nil, fmt.Errorf("worker: initialize %s consumer failed", kind)
+		return nil, fmt.Errorf("worker: initialize %s consumer failed: %w", kind, err)
 	}
 	if cfg.Enabled.Kafka {
-		manager.kafka, err = NewKafkaConsumer(cfg.Kafka, callback, alertMgr)
+		manager.kafka, err = NewKafkaConsumerWithContext(cfg.Kafka, callback, cfg.Runtime, alertMgr)
 		if err != nil {
 			return fail("kafka")
 		}
 	}
 
 	if cfg.Enabled.Rabbitmq {
-		manager.rabbitmq, err = NewRabbitmqConsumer(cfg.Rabbitmq, callback, alertMgr)
+		manager.rabbitmq, err = NewRabbitmqConsumerWithContext(cfg.Rabbitmq, callback, cfg.Runtime, alertMgr)
 		if err != nil {
 			return fail("rabbitmq")
 		}
 	}
 
 	if cfg.Enabled.Redis {
-		manager.redis, err = NewRedisConsumer(cfg.Redis, callback, alertMgr)
+		manager.redis, err = NewRedisConsumerWithContext(cfg.Redis, callback, cfg.Runtime, alertMgr)
 		if err != nil {
 			return fail("redis")
 		}
 	}
 
 	if cfg.Enabled.Delay {
-		manager.delay, err = NewDelayConsumer(cfg.Delay, callback, alertMgr)
+		manager.delay, err = NewDelayConsumerWithContext(cfg.Delay, callback, cfg.Runtime, alertMgr)
 		if err != nil {
 			return fail("delay")
 		}
@@ -98,7 +106,12 @@ func (c *ConsumeManager) CloseContext(ctx context.Context) error {
 				wg.Add(1)
 				go func() {
 					defer wg.Done()
-					err := close(context.WithoutCancel(ctx))
+					err := close(ctx)
+					if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+						// The timeout caller leaves, but actual resource cleanup is
+						// still observed by this single shutdown operation.
+						err = close(context.WithoutCancel(ctx))
+					}
 					mu.Lock()
 					c.closeErr = errors.Join(c.closeErr, err)
 					mu.Unlock()

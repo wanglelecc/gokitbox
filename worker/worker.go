@@ -2,10 +2,10 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/signal"
-	"runtime/debug"
 	"sync"
 	"syscall"
 	"time"
@@ -16,28 +16,25 @@ import (
 	"github.com/wanglelecc/gokitbox/worker/consumer"
 )
 
-// contextKey 用于 context.WithValue 的专用类型，避免与第三方包的 key 碰撞
-type contextKey string
-
 type Worker struct {
-	beforeFuncs []bootstrap.BeforeServerStartFunc
-	afterFuncs  []bootstrap.AfterServerStopFunc
-	exit        chan os.Signal
-
-	runDone   chan struct{}
-	runOnce   sync.Once
-	stopOnce  sync.Once
-	consumers *consumer.ConsumeManager
-
-	// 超时配置
-	shutdownTimeout time.Duration // 优雅关闭超时时间，默认30秒
-	retryDelay      time.Duration // 消息处理失败后重试延迟，默认500ms
-
-	// 告警配置
-	alertFunc   consumer.AlertFunc // 应用层注册的告警回调，为 nil 时不发告警
-	alertWindow time.Duration      // 告警收敛窗口，默认 1 分钟
+	mu                          sync.Mutex
+	state                       string
+	started                     bool
+	beforeFuncs                 []bootstrap.BeforeServerStartFunc
+	afterFuncs                  []bootstrap.AfterServerStopFunc
+	handlers                    map[string]Handle
+	exit                        chan os.Signal
+	startDone, runDone          chan struct{}
+	startOnce, stopOnce         sync.Once
+	startCtx                    context.Context
+	startCancel                 context.CancelFunc
+	stopErr                     error
+	consumers                   *consumer.ConsumeManager
+	shutdownTimeout, retryDelay time.Duration
+	retryConfigured             bool
+	alertFunc                   consumer.AlertFunc
+	alertWindow                 time.Duration
 }
-
 type Task struct {
 	Cmd  string
 	Ctx  context.Context
@@ -45,239 +42,389 @@ type Task struct {
 }
 
 func NewWorker() *Worker {
-	w := new(Worker)
-	w.exit = make(chan os.Signal, 1)
-
-	// 设置合理的默认值
-	w.shutdownTimeout = 30 * time.Second  // 默认30秒，满足大部分场景
-	w.retryDelay = 500 * time.Millisecond // 默认500ms
-
-	return w
+	return &Worker{state: "new", handlers: map[string]Handle{}, exit: make(chan os.Signal, 1), startDone: make(chan struct{}), runDone: make(chan struct{}), shutdownTimeout: 30 * time.Second, retryDelay: 500 * time.Millisecond}
 }
 
 func (w *Worker) Serve() error {
-	var err error
-	for _, fn := range w.beforeFuncs {
-		err = fn()
-		if err != nil {
-			return err
-		}
-	}
-
 	signal.Notify(w.exit, os.Interrupt, syscall.SIGTERM)
 	defer signal.Stop(w.exit)
-
-	w.waitShutdown()
-
-	for _, fn := range w.afterFuncs {
-		fn()
+	// Observe termination while startup is still running. A buffered result
+	// avoids stranding the startup goroutine if a legacy hook ignores cancel.
+	started := make(chan error, 1)
+	go func() { started <- w.Start(context.Background()) }()
+	select {
+	case <-w.exit:
+		return w.Stop(context.Background())
+	case err := <-started:
+		if err != nil {
+			return errors.Join(err, w.Stop(context.Background()))
+		}
 	}
-
-	return nil
-}
-
-func (w *Worker) waitShutdown() {
-	<-w.exit
-
-	ctx := context.Background()
-	logger.Ix(ctx, "worker", fmt.Sprintf(
-		"Received shutdown signal, starting graceful shutdown (timeout: %v)...",
-		w.shutdownTimeout))
-
-	startTime := time.Now()
-
-	// 同步调用：CloseWithTimeout 内部处理超时和日志，此处无需额外 goroutine。
-	// 避免异步关闭与 afterFuncs 里的 CloseConsumer() 并发执行的竞态问题。
-	if w.consumers != nil {
-		w.consumers.CloseWithTimeout(w.shutdownTimeout)
+	select {
+	case <-w.exit:
+		return w.Stop(context.Background())
+	case <-w.runDone:
+		return w.Wait()
 	}
-
-	logger.Ix(ctx, "worker", fmt.Sprintf(
-		"Graceful shutdown completed in %v", time.Since(startTime)))
 }
 
 func (w *Worker) parse(key string, value []byte) *Task {
-	ctx := context.Background()
-	ctx = context.WithValue(ctx, contextKey("log_id"), logger.GenLoggerId())
-	ctx = context.WithValue(ctx, contextKey("start"), time.Now())
-
-	task := new(Task)
-	task.Data = value
-	task.Cmd = key
-
-	// 处理链路ID，为空生成新链路ID埋入上下文
-	traceId := gjson.Get(string(task.Data), "trace_id").String()
-	if traceId == "" {
-		traceId = logger.GenTraceId()
-	}
-	ctx = context.WithValue(ctx, contextKey("trace_id"), traceId)
-
-	task.Ctx = ctx
-
-	return task
+	return w.parseContext(context.Background(), key, value)
 }
-
-func (w *Worker) deal(tplName string, key string, value []byte) (ret bool) {
-	// 解析消息
-	task := w.parse(key, value)
-
+func (w *Worker) parseContext(ctx context.Context, key string, value []byte) *Task {
+	ctx = context.WithValue(ctx, "log_id", logger.GenLoggerId())
+	ctx = context.WithValue(ctx, "start", time.Now())
+	trace := gjson.GetBytes(value, "trace_id").String()
+	if trace == "" {
+		trace = logger.GenTraceId()
+	}
+	ctx = context.WithValue(ctx, "trace_id", trace)
+	return &Task{Cmd: key, Ctx: ctx, Data: value}
+}
+func (w *Worker) lookup(name string) (Handle, error) {
+	w.mu.Lock()
+	h, ok := w.handlers[name]
+	w.mu.Unlock()
+	if ok && h != nil {
+		return h, nil
+	}
+	return GetHandle(name)
+}
+func (w *Worker) dealContext(ctx context.Context, tpl, key string, value []byte) (ok bool, err error) {
+	task := w.parseContext(ctx, key, value)
 	defer func() {
-		if r := recover(); r != nil {
-			logger.Ex(task.Ctx, "recovery", "worker deal recovery error", "error", fmt.Sprintf("%v", r), "stacks", string(debug.Stack()), "key", key, "value", string(value))
-			ret = false
+		if p := recover(); p != nil {
+			ok = false
+			err = fmt.Errorf("worker: handler panic (%T)", p)
+			logger.Ex(task.Ctx, "worker.handler", "handler panic", "key", key, "error", err)
 		}
 	}()
-
-	cmd := task.Cmd
-	if tplName != "" {
-		cmd = tplName
+	cmd := key
+	if tpl != "" {
+		cmd = tpl
 	}
-
-	if h, err := GetHandle(cmd); err == nil {
-		ret, err = h(task.Ctx, task.Data)
-	} else {
-		ret = false
-		logger.Ex(task.Ctx, "deal", "execute handle error", "error", err.Error(), "key", key, "value", string(value))
+	h, err := w.lookup(cmd)
+	if err != nil {
+		return false, err
 	}
-
-	if !ret {
-		// 使用配置的重试延迟（而非硬编码）
-		time.Sleep(w.retryDelay)
+	if err = ctx.Err(); err != nil {
+		return false, err
 	}
-
-	logger.Dx(task.Ctx, "deal", fmt.Sprintf("ret:%t, key:%s, value:%s", ret, key, string(value)))
-
-	return ret
+	ok, err = h(task.Ctx, task.Data)
+	if err != nil {
+		return false, err
+	}
+	if err = ctx.Err(); err != nil {
+		return false, err
+	}
+	return ok, nil
 }
 
+// deal is the legacy bool-only bridge; retries now belong to the consumer runner.
+func (w *Worker) deal(tpl, key string, value []byte) bool {
+	ok, err := w.dealContext(context.Background(), tpl, key, value)
+	if err != nil {
+		logger.Wx(context.Background(), "worker.handler", "handler failed", "key", key, "error", err)
+	}
+	return ok && err == nil
+}
 func (w *Worker) AddBeforeServerStartFunc(fns ...bootstrap.BeforeServerStartFunc) {
-	for _, fn := range fns {
-		w.beforeFuncs = append(w.beforeFuncs, fn)
-	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.beforeFuncs = append(w.beforeFuncs, fns...)
 }
-
 func (w *Worker) AddAfterServerStopFunc(fns ...bootstrap.AfterServerStopFunc) {
-	for _, fn := range fns {
-		w.afterFuncs = append(w.afterFuncs, fn)
-	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.afterFuncs = append(w.afterFuncs, fns...)
 }
-
-// SetShutdownTimeout 设置优雅关闭超时时间
-// 默认30秒。对于处理耗时较长的业务（如大文件处理），可调用此方法设置更长的超时时间
-// 示例: worker.NewWorker().SetShutdownTimeout(60 * time.Second)
 func (w *Worker) SetShutdownTimeout(timeout time.Duration) *Worker {
-	if timeout > 0 {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if timeout > 0 && w.state == "new" {
 		w.shutdownTimeout = timeout
 	}
 	return w
 }
-
-// SetRetryDelay 设置消息处理失败后的重试延迟
-// 默认500ms。可根据业务特点和下游服务恢复时间调整
-// 示例: worker.NewWorker().SetRetryDelay(1 * time.Second)
 func (w *Worker) SetRetryDelay(delay time.Duration) *Worker {
-	if delay > 0 {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if delay > 0 && w.state == "new" {
 		w.retryDelay = delay
+		w.retryConfigured = true
 	}
 	return w
 }
-
-// SetAlertFunc 注册告警回调，当消费者发生故障时触发
-//   - fn: 告警回调函数，在独立 goroutine 中调用，内部 panic 会被 recover 隔离
-//   - window: 同类告警收敛窗口，同一 (type, component, name) 组合在窗口期内只触发一次
-//     推荐 1~5 分钟；≤ 0 时默认 1 分钟
-//
-// 示例:
-//
-//	worker.NewWorker().SetAlertFunc(func(e consumer.AlertEvent) {
-//	    log.Printf("[ALERT] %s", e)
-//	    // 可接入钉钉/短信/PagerDuty...
-//	}, 2*time.Minute)
 func (w *Worker) SetAlertFunc(fn consumer.AlertFunc, window time.Duration) *Worker {
-	w.alertFunc = fn
-	w.alertWindow = window
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.state == "new" {
+		w.alertFunc = fn
+		w.alertWindow = window
+	}
 	return w
 }
-
-// 注册处理器
 func (w *Worker) RegisterHandle(handles map[string]Handle) bootstrap.BeforeServerStartFunc {
+	copy := make(map[string]Handle, len(handles))
+	for name, h := range handles {
+		copy[name] = h
+	}
 	return func() error {
-		BatchRegisterHandle(handles)
+		for name, h := range copy {
+			if name == "" || h == nil {
+				return errors.New("worker: non-empty handler name and function are required")
+			}
+		}
+		w.mu.Lock()
+		defer w.mu.Unlock()
+		for name, h := range copy {
+			w.handlers[name] = h
+		}
 		return nil
 	}
 }
-
-// 初始化 Consumer
-func (w *Worker) InitConsumer() bootstrap.BeforeServerStartFunc {
-	return w.InitConsumerWithConfig(nil)
-}
-
-// InitConsumerWithConfig bypasses the legacy independent configuration loader.
+func (w *Worker) InitConsumer() bootstrap.BeforeServerStartFunc { return w.InitConsumerWithConfig(nil) }
 func (w *Worker) InitConsumerWithConfig(cfg *consumer.Configure) bootstrap.BeforeServerStartFunc {
+	cfg = cfg.Snapshot()
 	return func() error {
-		var alertMgr *consumer.AlertManager
-		if w.alertFunc != nil {
-			alertMgr = consumer.NewAlertManager(w.alertFunc, w.alertWindow)
+		current := cfg.Snapshot()
+		if current == nil {
+			var err error
+			current, err = consumer.LoadDefaultConfigure()
+			if err != nil {
+				return err
+			}
 		}
-		if cfg == nil {
-			w.consumers = consumer.NewConsumeManager(w.deal, alertMgr)
-			return nil
+		w.mu.Lock()
+		ctx := w.startCtx
+		fn, window := w.alertFunc, w.alertWindow
+		retry, override := w.retryDelay, w.retryConfigured
+		existing := w.consumers
+		w.mu.Unlock()
+		if existing != nil {
+			return errors.New("worker: consumers already initialized")
 		}
-		var err error
-		w.consumers, err = consumer.NewConsumeManagerWithConfig(cfg, w.deal, alertMgr)
-		return err
+		if ctx != nil && ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if override {
+			current.Runtime.RetryDelay = retry
+		}
+		if err := current.Validate(); err != nil {
+			return err
+		}
+		if err := w.validateHandlers(current); err != nil {
+			return err
+		}
+
+		var alerts *consumer.AlertManager
+		if fn != nil {
+			alerts = consumer.NewAlertManager(fn, window)
+		}
+		manager, err := consumer.NewConsumeManagerWithContext(current, w.dealContext, alerts)
+		if err != nil {
+			return err
+		}
+		w.mu.Lock()
+		w.consumers = manager
+		w.mu.Unlock()
+		return nil
 	}
 }
-
-// 关闭 Consumer
 func (w *Worker) CloseConsumer() bootstrap.AfterServerStopFunc {
 	return func() {
-		ctx := context.Background()
-		logger.Wx(ctx, "Exec", "Process Stop...")
-		if w.consumers != nil {
-			w.consumers.Close()
+		w.mu.Lock()
+		c := w.consumers
+		w.mu.Unlock()
+		if c != nil {
+			c.Close()
 		}
-		logger.Wx(ctx, "Exec", "Process Stop Complete")
 	}
 }
+func SetConfigPath(path string) { consumer.SetConfigPath(path) }
 
-// 设置消费者配置文件路径
-func SetConfigPath(path string) {
-	consumer.SetConfigPath(path)
-}
-
-// Start/Wait/Stop expose a signal-free lifecycle to the composition root.
-func (w *Worker) Start(ctx context.Context) error {
-	if err := ctx.Err(); err != nil {
+func (w *Worker) Start(ctx context.Context) (err error) {
+	if err = ctx.Err(); err != nil {
 		return err
 	}
-	started := false
-	w.runOnce.Do(func() { started = true; w.runDone = make(chan struct{}) })
-	if !started {
-		return fmt.Errorf("worker: already started")
+	w.mu.Lock()
+	if w.state != "new" {
+		w.mu.Unlock()
+		return errors.New("worker: already started or stopped")
 	}
-	for _, fn := range w.beforeFuncs {
-		if err := fn(); err != nil {
+	w.state = "starting"
+	w.started = true
+	w.startCtx, w.startCancel = context.WithCancel(ctx)
+	startCtx := w.startCtx
+	hooks := append([]bootstrap.BeforeServerStartFunc(nil), w.beforeFuncs...)
+	w.mu.Unlock()
+	defer func() {
+		if p := recover(); p != nil {
+			err = fmt.Errorf("worker: start hook panic (%T)", p)
+		}
+		w.mu.Lock()
+		if err == nil && startCtx.Err() != nil {
+			err = startCtx.Err()
+		}
+		if err == nil && w.state == "starting" {
+			w.state = "running"
+		}
+		w.mu.Unlock()
+		w.startOnce.Do(func() { close(w.startDone) })
+		if err != nil {
+			w.beginStop(context.Background())
+		}
+	}()
+	for _, hook := range hooks {
+		if err = startCtx.Err(); err != nil {
+			return err
+		}
+		if hook == nil {
+			return errors.New("worker: nil start hook")
+		}
+		if err = hook(); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 func (w *Worker) Wait() error {
-	if w.runDone == nil {
-		return fmt.Errorf("worker: not started")
+	w.mu.Lock()
+	state := w.state
+	w.mu.Unlock()
+	if state == "new" {
+		return errors.New("worker: not started")
 	}
 	<-w.runDone
-	return nil
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.stopErr
+}
+func (w *Worker) beginStop(parent context.Context) {
+	w.stopOnce.Do(func() {
+		w.mu.Lock()
+		wasNew := w.state == "new"
+		w.state = "stopping"
+		cancel := w.startCancel
+		timeout := w.shutdownTimeout
+		w.mu.Unlock()
+		if cancel != nil {
+			cancel()
+		}
+		if wasNew {
+			w.startOnce.Do(func() { close(w.startDone) })
+		}
+		ctx, stop := context.WithTimeout(parent, timeout)
+		go func() { defer stop(); w.shutdown(ctx) }()
+	})
 }
 func (w *Worker) Stop(ctx context.Context) error {
-	if w.runDone == nil {
+	w.mu.Lock()
+	timeout := w.shutdownTimeout
+	w.mu.Unlock()
+	waitCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	w.beginStop(ctx)
+	select {
+	case <-w.runDone:
+		w.mu.Lock()
+		defer w.mu.Unlock()
+		return w.stopErr
+	case <-waitCtx.Done():
+		return waitCtx.Err()
+	}
+}
+func (w *Worker) shutdown(ctx context.Context) {
+	// An uncooperative legacy start hook cannot be killed. Stop can time out,
+	// but Wait must remain open until it stops creating resources.
+	<-w.startDone
+	w.mu.Lock()
+	manager := w.consumers
+	var hooks []bootstrap.AfterServerStopFunc
+	if w.started {
+		hooks = append(hooks, w.afterFuncs...)
+	}
+	w.mu.Unlock()
+	var result error
+	if manager != nil {
+		err := manager.CloseContext(ctx)
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			err = manager.CloseContext(context.WithoutCancel(ctx))
+		}
+		result = errors.Join(result, err)
+	}
+	for _, hook := range hooks {
+		err := func() (err error) {
+			defer func() {
+				if p := recover(); p != nil {
+					err = fmt.Errorf("worker: stop hook panic (%T)", p)
+				}
+			}()
+			if hook == nil {
+				return errors.New("worker: nil stop hook")
+			}
+			hook()
+			return nil
+		}()
+		result = errors.Join(result, err)
+	}
+	w.mu.Lock()
+	w.stopErr = result
+	w.state = "stopped"
+	w.mu.Unlock()
+	close(w.runDone)
+}
+
+func (w *Worker) validateHandlers(cfg *consumer.Configure) error {
+	check := func(name string) error {
+		_, err := w.lookup(name)
+		if err != nil {
+			return fmt.Errorf("worker: configured handler %q unavailable: %w", name, err)
+		}
 		return nil
 	}
-	defer w.stopOnce.Do(func() { close(w.runDone) })
-	if w.consumers != nil {
-		if err := w.consumers.CloseContext(ctx); err != nil {
-			return err
+	if cfg.Enabled.Kafka {
+		for _, v := range cfg.Kafka {
+			name := v.TplName
+			if name == "" {
+				name = v.Topic
+			}
+			if err := check(name); err != nil {
+				return err
+			}
+		}
+	}
+	if cfg.Enabled.Redis {
+		for _, v := range cfg.Redis {
+			name := v.TplName
+			if name == "" {
+				name = v.Queue
+			}
+			if err := check(name); err != nil {
+				return err
+			}
+		}
+	}
+	if cfg.Enabled.Delay {
+		for _, v := range cfg.Delay {
+			name := v.TplName
+			if name == "" {
+				name = v.Queue
+			}
+			if err := check(name); err != nil {
+				return err
+			}
+		}
+	}
+	// RoutingKey is not known until an AMQP delivery arrives. Validate explicit
+	// template names here and resolve dynamic legacy routing keys per delivery.
+	if cfg.Enabled.Rabbitmq {
+		for _, v := range cfg.Rabbitmq {
+			if v.TplName != "" {
+				if err := check(v.TplName); err != nil {
+					return err
+				}
+			}
 		}
 	}
 	return nil

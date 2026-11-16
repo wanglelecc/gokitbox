@@ -29,6 +29,7 @@ type ConsumeEnabled struct {
 
 // consumer config
 type Configure struct {
+	Runtime  RuntimeOptions    `json:"runtime" yaml:"runtime"`
 	Enabled  *ConsumeEnabled   `json:"enabled" yaml:"enabled"`
 	Kafka    []*KafkaConfig    `json:"kafka" yaml:"kafka"`
 	Rabbitmq []*RabbitmqConfig `json:"rabbitmq" yaml:"rabbitmq"`
@@ -132,15 +133,17 @@ func LoadConfigure(path string) (*Configure, error) {
 	return cfg, nil
 }
 
-func loadConfigure() *Configure {
+func LoadDefaultConfigure() (*Configure, error) {
 	configPathLock.RLock()
 	cp, explicit := configPath, configPathExplicit
 	configPathLock.RUnlock()
-	// An explicit caller path always wins over legacy App.workerConfigPath.
 	if !explicit {
 		cp = configsource.GetConfDefault("App", "workerConfigPath", cp)
 	}
-	cfg, err := LoadConfigure(cp)
+	return LoadConfigure(cp)
+}
+func loadConfigure() *Configure {
+	cfg, err := LoadDefaultConfigure()
 	if err != nil {
 		panic(fmt.Sprintf("failed to load consumer configuration: %v", err))
 	}
@@ -159,6 +162,9 @@ func (c *Configure) Validate() error {
 	if c == nil || c.Enabled == nil {
 		return fmt.Errorf("worker: enabled configuration is required")
 	}
+	if err := c.Runtime.Validate(); err != nil {
+		return err
+	}
 	if c.Enabled.Kafka {
 		if len(c.Kafka) == 0 {
 			return fmt.Errorf("worker: kafka consumers are required")
@@ -172,10 +178,10 @@ func (c *Configure) Validate() error {
 					return fmt.Errorf("worker: empty Kafka broker")
 				}
 			}
-			if v.SASL == nil {
-				return fmt.Errorf("worker: kafka sasl configuration is required (enabled: false to disable)")
+			if err := c.Runtime.validateKafka(v); err != nil {
+				return err
 			}
-			if v.SASL.Enabled && (v.SASL.User == "" || v.SASL.Password == "") {
+			if v.SASL != nil && v.SASL.Enabled && (v.SASL.User == "" || v.SASL.Password == "") {
 				return fmt.Errorf("worker: enabled Kafka SASL requires user and password")
 			}
 		}
@@ -211,4 +217,50 @@ func (c *Configure) Validate() error {
 		}
 	}
 	return nil
+}
+
+// Snapshot prevents caller mutation after goroutines have been started.
+func (c *Configure) Snapshot() *Configure {
+	if c == nil {
+		return nil
+	}
+	copy := *c
+	if c.Enabled != nil {
+		enabled := *c.Enabled
+		copy.Enabled = &enabled
+	}
+	copy.Kafka = make([]*KafkaConfig, len(c.Kafka))
+	for i, v := range c.Kafka {
+		if v != nil {
+			item := *v
+			item.Host = append([]string(nil), v.Host...)
+			if v.SASL != nil {
+				sasl := *v.SASL
+				item.SASL = &sasl
+			}
+			copy.Kafka[i] = &item
+		}
+	}
+	copy.Rabbitmq = make([]*RabbitmqConfig, len(c.Rabbitmq))
+	for i, v := range c.Rabbitmq {
+		if v != nil {
+			item := *v
+			copy.Rabbitmq[i] = &item
+		}
+	}
+	copy.Redis = make([]*RedisConfig, len(c.Redis))
+	for i, v := range c.Redis {
+		if v != nil {
+			item := *v
+			copy.Redis[i] = &item
+		}
+	}
+	copy.Delay = make([]*DelayConfig, len(c.Delay))
+	for i, v := range c.Delay {
+		if v != nil {
+			item := *v
+			copy.Delay[i] = &item
+		}
+	}
+	return &copy
 }

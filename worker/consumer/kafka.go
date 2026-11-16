@@ -20,9 +20,11 @@ const (
 )
 
 type KafkaConsumer struct {
-	stopOnce  sync.Once
-	closeDone chan struct{}
-	closeErr  error
+	runtime        *consumerRuntime
+	sessionFactory func(*KafkaConfig) (kafkaSession, error)
+	stopOnce       sync.Once
+	closeDone      chan struct{}
+	closeErr       error
 
 	quit         chan struct{}
 	callback     ConsumeCallback
@@ -43,12 +45,24 @@ type KafkaConsumer struct {
 }
 
 func NewKafkaConsumer(configs []*KafkaConfig, callback ConsumeCallback, alertMgr *AlertManager) (consumer *KafkaConsumer, err error) {
+	return NewKafkaConsumerWithContext(configs, adaptCallback(callback), RuntimeOptions{}, alertMgr)
+}
+func NewKafkaConsumerWithContext(configs []*KafkaConfig, callback ContextConsumeCallback, options RuntimeOptions, alertMgr *AlertManager) (consumer *KafkaConsumer, err error) {
+	cfg := (&Configure{Enabled: &ConsumeEnabled{Kafka: true}, Kafka: configs, Runtime: options}).Snapshot()
+	if callback == nil {
+		return nil, errors.New("worker: callback is required")
+	}
+	if validationErr := cfg.Validate(); validationErr != nil {
+		return nil, validationErr
+	}
+	configs = cfg.Kafka
+
 	if len(configs) == 0 {
 		err = errors.New("kafka config not found")
 		return
 	}
 	consumer = new(KafkaConsumer)
-	consumer.callback = callback
+	consumer.runtime = newRuntime(options, callback)
 	consumer.alertMgr = alertMgr
 	consumer.quit = make(chan struct{})
 	consumer.wg = new(sync.WaitGroup)
@@ -60,7 +74,9 @@ func NewKafkaConsumer(configs []*KafkaConfig, callback ConsumeCallback, alertMgr
 			return nil, errors.New("kafka: nil consumer configuration")
 		}
 	}
-	consumer.producers, err = createFailureProducers(configs, func(cfg *KafkaConfig) (kafkaFailureProducer, error) { return newKafkaProducer(cfg) })
+	consumer.producers, err = createFailureProducers(configs, func(cfg *KafkaConfig) (kafkaFailureProducer, error) {
+		return newKafkaProducerWithOptions(cfg, options.defaults())
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -95,7 +111,13 @@ func (k *KafkaConsumer) CloseContext(ctx context.Context) error {
 		close(k.quit)
 		go func() {
 			defer close(k.closeDone)
+			stopCancellation := k.runtime.cancelOnDeadline(ctx)
+			defer stopCancellation()
+			if k.runtime != nil {
+				defer k.runtime.cancel()
+			}
 			k.wg.Wait()
+			k.closeErr = errors.Join(k.closeErr, k.runtime.drainError())
 			deadline := time.Now().Add(10 * time.Second)
 			if configured, ok := ctx.Deadline(); ok && configured.Before(deadline) {
 				deadline = configured
@@ -148,20 +170,25 @@ func (k *KafkaConsumer) initKafka(cfg *KafkaConfig) (*kafka.Consumer, error) {
 	ctx := context.Background()
 
 	kafkaCfg := &kafka.ConfigMap{
-		"api.version.request":   "true",
+
 		"auto.offset.reset":     "earliest",
-		"heartbeat.interval.ms": 3000,
+		"heartbeat.interval.ms": int(k.runtime.opts().SessionTimeout / (3 * time.Millisecond)),
 
 		// 使用 Kafka 消费分组机制时，消费者超时时间。当 Broker 在该时间内没有收到消费者的心跳时，认为该消费者故障失败，Broker
 		// 发起重新 Rebalance 过程。目前该值的配置必须在 Broker 配置group.min.session.timeout.ms=6000和group.max.session.timeout.ms=300000 之间
-		"session.timeout.ms": 30000,
+		"session.timeout.ms": int(k.runtime.opts().SessionTimeout / time.Millisecond),
 
-		"max.poll.interval.ms":      120000,
-		"fetch.max.bytes":           1024000,
-		"max.partition.fetch.bytes": 256000,
+		"max.poll.interval.ms":               int(k.runtime.opts().MaxPollInterval / time.Millisecond),
+		"socket.timeout.ms":                  int(k.runtime.opts().OperationTimeout / time.Millisecond),
+		"socket.connection.setup.timeout.ms": int(k.runtime.opts().OperationTimeout / time.Millisecond),
+		"api.version.request.timeout.ms":     int(k.runtime.opts().OperationTimeout / time.Millisecond),
+		"fetch.wait.max.ms":                  min(500, max(0, int(k.runtime.opts().OperationTimeout/time.Millisecond)-1000)),
+		"fetch.max.bytes":                    1024000,
+		"max.partition.fetch.bytes":          256000,
 
 		// 禁用自动提交，改为手动提交以确保消息处理成功后才提交offset
-		"enable.auto.commit": false,
+		"enable.auto.commit":       false,
+		"enable.auto.offset.store": false,
 	}
 
 	kafkaCfg.SetKey("bootstrap.servers", strings.Join(cfg.Host, ","))
@@ -178,13 +205,13 @@ func (k *KafkaConsumer) initKafka(cfg *KafkaConfig) (*kafka.Consumer, error) {
 
 	consumer, err := kafka.NewConsumer(kafkaCfg)
 	if err != nil {
-		logger.Fx(ctx, "Consume", "NewConsumer error", "error", err)
+		logger.Ex(ctx, "Consume", "NewConsumer error", "error", err)
 		return nil, fmt.Errorf("new consumer: %w", err)
 	}
 
 	if err = consumer.SubscribeTopics([]string{cfg.Topic}, nil); err != nil {
 		consumer.Close()
-		logger.Fx(ctx, "Consume", "SubscribeTopics error", "error", err)
+		logger.Ex(ctx, "Consume", "SubscribeTopics error", "error", err)
 		return nil, fmt.Errorf("subscribe topics: %w", err)
 	}
 
@@ -192,14 +219,25 @@ func (k *KafkaConsumer) initKafka(cfg *KafkaConfig) (*kafka.Consumer, error) {
 }
 
 // newKafkaProducer 创建 Kafka Producer，供 NewKafkaConsumer 在启动时调用（fail-fast）
-func newKafkaProducer(cfg *KafkaConfig) (*kafka.Producer, error) {
+func newKafkaProducer(cfg *KafkaConfig) (kafkaFailureProducer, error) {
+	return newKafkaProducerWithOptions(cfg, RuntimeOptions{}.defaults())
+}
+func newKafkaProducerWithOptions(cfg *KafkaConfig, options RuntimeOptions) (kafkaFailureProducer, error) {
 	pCfg := kafkaProducerOptions(cfg)
+	timeoutMs := int(options.DeliveryTimeout / time.Millisecond)
+	(*pCfg)["message.timeout.ms"] = timeoutMs
+	(*pCfg)["socket.timeout.ms"] = int(options.OperationTimeout / time.Millisecond)
+	(*pCfg)["socket.connection.setup.timeout.ms"] = int(options.OperationTimeout / time.Millisecond)
+	(*pCfg)["api.version.request.timeout.ms"] = min(300000, int(options.OperationTimeout/time.Millisecond))
+	linger := min(5, timeoutMs/4)
+	(*pCfg)["linger.ms"] = linger
+	(*pCfg)["sticky.partitioning.linger.ms"] = 2 * linger
 
 	p, err := kafka.NewProducer(pCfg)
 	if err != nil {
 		return nil, fmt.Errorf("new kafka producer: %w", err)
 	}
-	return p, nil
+	return ownFailureProducer(p), nil
 }
 
 // consume 外层自愈循环：doConsume 异常退出后按指数退避重启
@@ -208,7 +246,7 @@ func (k *KafkaConsumer) consume(config *KafkaConfig) {
 	atomic.AddInt32(&k.activeGoroutines, 1)
 	defer atomic.AddInt32(&k.activeGoroutines, -1)
 
-	ctx := context.Background()
+	ctx := k.runtime.context()
 	bo := newBackoff(time.Second, 30*time.Second)
 
 	for {
@@ -263,7 +301,13 @@ func (k *KafkaConsumer) doConsume(ctx context.Context, config *KafkaConfig, bo *
 		}
 	}()
 
-	consumer, err := k.initKafka(config)
+	var consumer kafkaSession
+	var err error
+	if k.sessionFactory != nil {
+		consumer, err = k.sessionFactory(config)
+	} else {
+		consumer, err = k.initKafka(config)
+	}
 	if err != nil {
 		logger.Ex(ctx, "KafkaConsume", fmt.Sprintf("init kafka error: %v", err))
 		k.alertMgr.Emit(AlertEvent{
@@ -275,10 +319,15 @@ func (k *KafkaConsumer) doConsume(ctx context.Context, config *KafkaConfig, bo *
 		})
 		return false
 	}
-	defer consumer.Close()
+	owner := &kafkaSessionOwner{session: consumer}
+	defer func() {
+		if err := owner.close(); err != nil {
+			k.runtime.recordError(err)
+			logger.Wx(ctx, "KafkaConsume", "close failed", "error", err)
+		}
+	}()
 
 	// 连接成功，重置退避
-	bo.Reset()
 	logger.Ix(ctx, "KafkaConsume", fmt.Sprintf("Start consume from broker %v", config.Host))
 	k.alertMgr.Emit(AlertEvent{
 		Component: ComponentKafka,
@@ -287,126 +336,131 @@ func (k *KafkaConsumer) doConsume(ctx context.Context, config *KafkaConfig, bo *
 		Message:   fmt.Sprintf("connected to broker %v", config.Host),
 	})
 
+	return k.consumeSession(ctx, config, bo, owner)
+}
+
+// Processing is serial within a session. Any unresolved delivery or commit ends
+// the session before another ReadMessage: later offsets cannot cross a hole.
+func (k *KafkaConsumer) consumeSession(ctx context.Context, config *KafkaConfig, bo *backoff, owner *kafkaSessionOwner) bool {
 	for {
-		// 检查退出信号
-		select {
-		case <-k.quit:
-			logger.Wx(ctx, "KafkaConsume", "IKAFKA_RECV_QUIT")
+		if stopRequested(ctx, k.quit) {
 			return true
-		default:
 		}
-
-		// 使用1秒超时，避免无限期阻塞，确保能及时响应quit信号
-		event, err := consumer.ReadMessage(time.Second)
+		event, err := owner.session.ReadMessage(200 * time.Millisecond)
 		if err != nil {
-			if kafkaErr, ok := err.(kafka.Error); ok {
-				// 超时是正常情况，继续下一轮循环（会检查quit信号）
-				if kafkaErr.Code() == kafka.ErrTimedOut {
-					continue
-				}
-				logger.Ex(ctx, "KafkaConsume", "ReadMessage error", "error", err.Error(), "code", kafkaErr.Code())
-			} else {
-				logger.Ex(ctx, "KafkaConsume", "ReadMessage error", "error", err.Error())
+			var kafkaErr kafka.Error
+			if errors.As(err, &kafkaErr) && kafkaErr.Code() == kafka.ErrTimedOut {
+				continue
 			}
-			select {
-			case <-k.quit:
-				return true
-			case <-time.After(time.Millisecond * 100):
-			}
-			continue
+			logger.Wx(ctx, "KafkaConsume", "read failed", "error", err)
+			return stopRequested(ctx, k.quit)
 		}
-
-		// 处理消息
-		needCommit := false
-		count := 0
-		for {
-			ret := k.callback(config.TplName, config.Topic, event.Value)
-			if ret {
-				atomic.AddInt64(&k.successCount, int64(1))
-				logger.Dx(ctx, "KafkaConsume", fmt.Sprintf("return_true:KEY:%s,OFFSET:%d,PARTITION:%d", string(event.Key), event.TopicPartition.Offset, event.TopicPartition.Partition))
-				needCommit = true
-				break
-			}
-
-			logger.Ex(ctx, "KafkaConsume", fmt.Sprintf("return_false:KEY:%s,VAL:%s,OFFSET:%d,PARTITION:%d", string(event.Key), string(event.Value), event.TopicPartition.Offset, event.TopicPartition.Partition))
-
-			if count >= config.FailCount {
-				if config.FailTopic != "" {
-					sent := false
-					for i := 0; i < 3; i++ {
-						if err := k.sendByHashPartition(config, config.FailTopic, event.Value, event.Key); err != nil {
-							logger.Ex(ctx, "KafkaConsume", fmt.Sprintf("SendToFailTopic error:%s %s %v", config.FailTopic, string(event.Value), err))
-							select {
-							case <-k.quit:
-								return true
-							case <-time.After(time.Millisecond * 100):
-							}
-							continue
-						}
-						sent = true
-						break
-					}
-					if sent {
-						logger.Dx(ctx, "KafkaConsume", fmt.Sprintf("Sent to Fail Topic:KEY:%s,VAL:%s,OFFSET:%d,PARTITION:%d", string(event.Key), string(event.Value), event.TopicPartition.Offset, event.TopicPartition.Partition))
-						needCommit = true
-					} else {
-						logger.Ex(ctx, "KafkaConsume", fmt.Sprintf("Failed to send to Fail Topic after 3 retries:KEY:%s,VAL:%s", string(event.Key), string(event.Value)))
-						k.alertMgr.Emit(AlertEvent{
-							Component: ComponentKafka,
-							Name:      config.Topic,
-							Type:      AlertMsgDiscard,
-							Message:   fmt.Sprintf("failed to send to fail topic %s after 3 retries, offset=%d", config.FailTopic, event.TopicPartition.Offset),
-						})
-						// 发送失败队列失败，不提交offset，下次重试
-						needCommit = false
-					}
-				} else {
-					logger.Ex(ctx, "KafkaConsume", fmt.Sprintf("Fail Topic is empty:KEY:%s,VAL:%s,OFFSET:%d,PARTITION:%d", string(event.Key), string(event.Value), event.TopicPartition.Offset, event.TopicPartition.Partition))
-					k.alertMgr.Emit(AlertEvent{
-						Component: ComponentKafka,
-						Name:      config.Topic,
-						Type:      AlertMsgDiscard,
-						Message:   fmt.Sprintf("no fail topic configured, discarding after %d retries, offset=%d", config.FailCount, event.TopicPartition.Offset),
-					})
-					// 没有配置失败队列，提交offset避免重复消费
-					needCommit = true
-				}
-				break
-			}
-			count++
-			select {
-			case <-k.quit:
-				return true
-			case <-time.After(time.Millisecond * 100):
-			}
+		if err = k.processMessage(ctx, config, owner, event); err != nil {
+			logger.Wx(ctx, "KafkaConsume", "message unresolved; closing session without advancing", "error", err, "offset", event.TopicPartition.Offset, "partition", event.TopicPartition.Partition)
+			return stopRequested(ctx, k.quit)
 		}
-
-		// 手动提交 offset，最多重试 3 次，防止网络抖动导致 FailTopic 重复写入
-		if needCommit {
-			committed := false
-			for i := 0; i < 3; i++ {
-				if _, err := consumer.CommitMessage(event); err != nil {
-					logger.Ex(ctx, "KafkaConsume", fmt.Sprintf("Commit offset error (attempt %d/3)", i+1), "error", err.Error(), "offset", event.TopicPartition.Offset, "partition", event.TopicPartition.Partition)
-					select {
-					case <-k.quit:
-						return true
-					case <-time.After(time.Millisecond * 100):
-					}
-					continue
-				}
-				committed = true
-				break
-			}
-			if !committed {
-				atomic.AddInt64(&k.errorCount, int64(1))
-				logger.Ex(ctx, "KafkaConsume", "Commit offset failed after 3 retries, message may be re-consumed", "offset", event.TopicPartition.Offset, "partition", event.TopicPartition.Partition)
-			}
-		}
+		bo.Reset()
 	}
 }
+func (k *KafkaConsumer) processMessage(ctx context.Context, config *KafkaConfig, owner *kafkaSessionOwner, event *kafka.Message) error {
+	options := k.runtime.opts()
+	processed := false
+	for attempt := 0; attempt <= config.FailCount; attempt++ {
+		if stopRequested(ctx, k.quit) {
+			return context.Canceled
+		}
+		if k.runtime.call(ctx, k.callback, config.TplName, config.Topic, event.Value) {
+			processed = true
+			atomic.AddInt64(&k.successCount, 1)
+			break
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if attempt < config.FailCount && !waitRetry(ctx, k.quit, options.RetryDelay) {
+			return context.Canceled
+		}
+	}
+	if !processed {
+		atomic.AddInt64(&k.errorCount, 1)
+		if config.FailTopic != "" {
+			var last error
+			for attempt := 0; attempt < 3; attempt++ {
+				if stopRequested(ctx, k.quit) {
+					return context.Canceled
+				}
+				last = k.sendByHashPartitionContext(ctx, config, config.FailTopic, event.Value, event.Key)
+				if last == nil {
+					break
+				}
+				if attempt < 2 && !waitRetry(ctx, k.quit, options.RetryDelay) {
+					return context.Canceled
+				}
+			}
+			if last != nil {
+				return fmt.Errorf("failure topic not acknowledged: %w", last)
+			}
+		} else {
+			// Preserve the documented explicit-discard policy when no fail topic exists.
+			k.alertMgr.Emit(AlertEvent{Component: ComponentKafka, Name: config.Topic, Type: AlertMsgDiscard, Message: "no failure topic; retry limit reached"})
+		}
+	}
+	var last error
+	for attempt := 0; attempt < 3; attempt++ {
+		commitCtx, cancel := boundedContext(ctx, options.OperationTimeout)
+		last = owner.commit(commitCtx, event)
+		cancel()
+		if last == nil {
+			return nil
+		}
+		// A timed-out commit has an uncertain outcome. Never start another operation
+		// against this session or read a later message while it remains outstanding.
+		if errors.Is(last, context.DeadlineExceeded) || errors.Is(last, context.Canceled) {
+			return last
+		}
+		if attempt < 2 && !waitRetry(ctx, k.quit, options.RetryDelay) {
+			return context.Canceled
+		}
+	}
+	return fmt.Errorf("commit failed; refusing to advance: %w", last)
+}
+
+type kafkaSession interface {
+	ReadMessage(time.Duration) (*kafka.Message, error)
+	CommitMessage(*kafka.Message) ([]kafka.TopicPartition, error)
+	Close() error
+}
+type kafkaSessionOwner struct {
+	session    kafkaSession
+	operations sync.WaitGroup
+}
+
+func (o *kafkaSessionOwner) commit(ctx context.Context, event *kafka.Message) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	result := make(chan error, 1)
+	o.operations.Add(1)
+	go func() { defer o.operations.Done(); _, err := o.session.CommitMessage(event); result <- err }()
+	select {
+	case err := <-result:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+func (o *kafkaSessionOwner) close() error { o.operations.Wait(); return o.session.Close() }
 
 // sendByHashPartition 同步发送消息到指定 topic，等待 broker 确认后才返回
 func (k *KafkaConsumer) sendByHashPartition(cfg *KafkaConfig, topic string, data []byte, key []byte) error {
+	return k.sendByHashPartitionContext(k.runtime.context(), cfg, topic, data, key)
+}
+func (k *KafkaConsumer) sendByHashPartitionContext(parent context.Context, cfg *KafkaConfig, topic string, data, key []byte) error {
+	ctx, cancel := boundedContext(parent, k.runtime.opts().DeliveryTimeout)
+	defer cancel()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	producer := k.producers[kafkaResourceKey(cfg)]
 	if producer == nil {
 		return fmt.Errorf("producer not initialized (FailTopic requires a valid producer)")
@@ -422,7 +476,12 @@ func (k *KafkaConsumer) sendByHashPartition(cfg *KafkaConfig, topic string, data
 		return fmt.Errorf("produce: %w", err)
 	}
 
-	e := <-deliveryChan
+	var e kafka.Event
+	select {
+	case e = <-deliveryChan:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 	m, ok := e.(*kafka.Message)
 	if !ok {
 		return fmt.Errorf("unexpected delivery event type: %T", e)
@@ -431,6 +490,6 @@ func (k *KafkaConsumer) sendByHashPartition(cfg *KafkaConfig, topic string, data
 		return fmt.Errorf("delivery failed: %w", m.TopicPartition.Error)
 	}
 
-	logger.Dx(context.Background(), "SendByHashPartition", fmt.Sprintf("[KAFKA_OUT]topic:%s,data:%s", topic, string(data)))
+	logger.Dx(ctx, "SendByHashPartition", "failure message acknowledged", "topic", topic, "bytes", len(data))
 	return nil
 }
