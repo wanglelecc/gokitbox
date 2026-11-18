@@ -6,19 +6,15 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"io"
-	"mime/multipart"
-	"net"
 	"net/http"
 	neturl "net/url"
-	"os"
-	"path/filepath"
 	"strings"
-	"time"
 )
 
 // Config HTTP 客户端超时配置（单位：秒）
 type Config struct {
+	MaxResponseBytes      int64
+	MaxUploadBytes        int64
 	DialTimeout           int // TCP 连接超时，默认 10s
 	DialKeepAlive         int // 长连接保活时间，默认 30s
 	TLSHandshakeTimeout   int // TLS 握手超时，默认 10s
@@ -43,23 +39,6 @@ func DefaultConfig() Config {
 	}
 }
 
-// newClient 根据配置创建 http.Client
-func newClient(cfg Config) *http.Client {
-	transport := &http.Transport{
-		DialContext: (&net.Dialer{
-			Timeout:   time.Duration(cfg.DialTimeout) * time.Second,
-			KeepAlive: time.Duration(cfg.DialKeepAlive) * time.Second,
-		}).DialContext,
-		TLSHandshakeTimeout:   time.Duration(cfg.TLSHandshakeTimeout) * time.Second,
-		ResponseHeaderTimeout: time.Duration(cfg.ResponseHeaderTimeout) * time.Second,
-		ExpectContinueTimeout: time.Duration(cfg.ExpectContinueTimeout) * time.Second,
-	}
-	return &http.Client{
-		Timeout:   time.Duration(cfg.Timeout) * time.Second,
-		Transport: transport,
-	}
-}
-
 // Request 发起 HTTP 请求，支持 context 取消与超时
 // 返回：HTTP 状态码、响应头、响应体、错误
 //
@@ -73,25 +52,14 @@ func newClient(cfg Config) *http.Client {
 //	    uHTTP.DefaultConfig(),
 //	)
 func Request(ctx context.Context, method, url string, headers map[string]string, body string, cfg Config) (statusCode int, respHeader http.Header, respBody []byte, err error) {
-	req, err := http.NewRequestWithContext(ctx, method, url, strings.NewReader(body))
+	client, owned, err := clientFor(cfg)
 	if err != nil {
-		return
+		return 0, nil, nil, err
 	}
-
-	for k, v := range headers {
-		req.Header.Set(k, v)
+	if owned {
+		defer client.Close()
 	}
-
-	resp, err := newClient(cfg).Do(req)
-	if err != nil {
-		return
-	}
-	defer resp.Body.Close()
-
-	respBody, err = io.ReadAll(resp.Body)
-	respHeader = resp.Header
-	statusCode = resp.StatusCode
-	return
+	return client.Do(ctx, method, url, headers, strings.NewReader(body))
 }
 
 // Get 发起 GET 请求，非 200 状态码时返回 error
@@ -177,18 +145,9 @@ func PostJSON(ctx context.Context, url string, payload any, headers map[string]s
 //
 //	header, err := uHTTP.Head(ctx, "https://example.com/file.zip")
 //	size := header.Get("Content-Length")
-func Head(ctx context.Context, url string) (respHeader http.Header, err error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodHead, url, nil)
-	if err != nil {
-		return
-	}
-	resp, err := newClient(DefaultConfig()).Do(req)
-	if err != nil {
-		return
-	}
-	defer resp.Body.Close()
-	respHeader = resp.Header
-	return
+func Head(ctx context.Context, url string) (http.Header, error) {
+	_, h, _, err := defaultClient.Do(ctx, http.MethodHead, url, nil, nil)
+	return h, err
 }
 
 // Upload 发起 multipart 文件上传请求，支持同时携带表单字段
@@ -203,54 +162,14 @@ func Head(ctx context.Context, url string) (respHeader http.Header, err error) {
 //	    uHTTP.DefaultConfig(),
 //	)
 func Upload(ctx context.Context, url string, fields map[string]string, files map[string]string, headers map[string]string, cfg Config) (statusCode int, respHeader http.Header, respBody []byte, err error) {
-	buf := &bytes.Buffer{}
-	w := multipart.NewWriter(buf)
-
-	for fieldName, filePath := range files {
-		fw, e := w.CreateFormFile(fieldName, filepath.Base(filePath))
-		if e != nil {
-			err = fmt.Errorf("create form file %s: %w", fieldName, e)
-			return
-		}
-		f, e := os.Open(filePath)
-		if e != nil {
-			err = fmt.Errorf("open file %s: %w", filePath, e)
-			return
-		}
-		_, e = io.Copy(fw, f)
-		f.Close()
-		if e != nil {
-			err = fmt.Errorf("copy file %s: %w", filePath, e)
-			return
-		}
+	client, owned, e := clientFor(cfg)
+	if e != nil {
+		return 0, nil, nil, e
 	}
-
-	for k, v := range fields {
-		_ = w.WriteField(k, v)
+	if owned {
+		defer client.Close()
 	}
-
-	contentType := w.FormDataContentType()
-	_ = w.Close()
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, buf)
-	if err != nil {
-		return
-	}
-	req.Header.Set("Content-Type", contentType)
-	for k, v := range headers {
-		req.Header.Set(k, v)
-	}
-
-	resp, err := newClient(cfg).Do(req)
-	if err != nil {
-		return
-	}
-	defer resp.Body.Close()
-
-	respBody, err = io.ReadAll(resp.Body)
-	respHeader = resp.Header
-	statusCode = resp.StatusCode
-	return
+	return client.Upload(ctx, url, fields, files, headers)
 }
 
 // BasicAuth 生成 HTTP Basic Auth 认证头的值（Base64 编码）

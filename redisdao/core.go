@@ -2,6 +2,7 @@ package redisdao
 
 import (
 	"crypto/tls"
+	"fmt"
 	"log"
 	"strconv"
 	"sync"
@@ -11,7 +12,8 @@ import (
 	"github.com/wanglelecc/gokitbox/configsource"
 )
 
-var initOnce sync.Once
+var initMu sync.Mutex
+var initialized, stopped bool
 
 var instance = struct {
 	sync.RWMutex
@@ -19,27 +21,40 @@ var instance = struct {
 }{redisInstances: make(map[string]*redis.Client, 0)}
 
 func Init() {
-	initOnce.Do(func() {
-		optionsMu.Lock()
-		started = true
-		opts := configuredOptions
-		optionsMu.Unlock()
-		if opts == nil {
-			o := legacyOptions()
-			opts = &o
-		}
-		if err := opts.Validate(); err != nil {
-			panic(err)
-		}
-		clients := make(map[string]*redis.Client, len(opts.Instances))
-		for name, option := range opts.Instances {
-			copyOptions := option
-			clients[name] = redis.NewClient(&copyOptions)
-		}
-		instance.Lock()
-		instance.redisInstances = clients
-		instance.Unlock()
-	})
+	if err := Initialize(); err != nil {
+		panic(err)
+	}
+}
+func Initialize() error {
+	initMu.Lock()
+	defer initMu.Unlock()
+	if stopped {
+		return fmt.Errorf("redisdao: closed")
+	}
+	if initialized {
+		return nil
+	}
+	optionsMu.Lock()
+	started = true
+	opts := configuredOptions
+	optionsMu.Unlock()
+	if opts == nil {
+		o := legacyOptions()
+		opts = &o
+	}
+	if err := opts.Validate(); err != nil {
+		return err
+	}
+	clients := map[string]*redis.Client{}
+	for name, option := range opts.Instances {
+		copyOptions := option
+		clients[name] = redis.NewClient(&copyOptions)
+	}
+	instance.Lock()
+	instance.redisInstances = clients
+	instance.Unlock()
+	initialized = true
+	return nil
 }
 
 func legacyOptions() Options {

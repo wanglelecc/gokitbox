@@ -11,7 +11,8 @@ import (
 	"xorm.io/xorm"
 )
 
-var initOnce sync.Once
+var initMu sync.Mutex
+var initialized, closed bool
 
 type DBDao struct {
 	Engine *xorm.EngineGroup
@@ -24,18 +25,27 @@ var (
 )
 
 func initialize() error {
-	initOnce.Do(func() {
-		optionsMu.Lock()
-		started = true
-		opts := configuredOptions
-		optionsMu.Unlock()
-		if opts == nil {
-			o := legacyOptions()
-			opts = &o
-		}
-		initErr = initDbWithOptions(*opts)
-	})
-	return initErr
+	initMu.Lock()
+	defer initMu.Unlock()
+	if closed {
+		return fmt.Errorf("dbdao: closed")
+	}
+	if initialized {
+		return nil
+	}
+	optionsMu.Lock()
+	started = true
+	opts := configuredOptions
+	optionsMu.Unlock()
+	if opts == nil {
+		o := legacyOptions()
+		opts = &o
+	}
+	if err := initDbWithOptions(*opts); err != nil {
+		return err
+	}
+	initialized = true
+	return nil
 }
 
 // InitWithOptions is the explicit initialization API. Configure may instead be
@@ -90,6 +100,9 @@ func initDbWithOptions(o Options) error {
 
 // CloseAll closes all engines initialized by this module.
 func CloseAll() error {
+	initMu.Lock()
+	defer initMu.Unlock()
+	closed = true
 	var first error
 	for _, db := range dbInstance {
 		if err := db.Close(); err != nil && first == nil {

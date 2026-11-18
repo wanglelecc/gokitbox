@@ -19,10 +19,10 @@ import (
 
 	"github.com/smallnest/rpcx/protocol"
 	"github.com/smallnest/rpcx/server"
-	"github.com/spf13/cast"
 	"github.com/wanglelecc/gokitbox/bootstrap"
 	"github.com/wanglelecc/gokitbox/configsource"
 	"github.com/wanglelecc/gokitbox/logger"
+	"github.com/wanglelecc/gokitbox/rpcxauth"
 )
 
 // isShutdownError 判断是否为关闭相关的错误
@@ -40,6 +40,11 @@ func isShutdownError(err error) bool {
 
 // Server struct
 type Server struct {
+	lifeMu        sync.Mutex
+	lifeClosed    bool
+	startDone     chan struct{}
+	startErr      error
+	startCancel   context.CancelFunc
 	runDone       chan struct{}
 	runErr        error
 	runStarted    int32
@@ -76,6 +81,7 @@ type Server struct {
 	authMu            sync.RWMutex
 	timestampDuration time.Duration
 	durationOnce      sync.Once
+	authV2            AuthOptions
 }
 
 // NewServer get server instance
@@ -164,47 +170,26 @@ func (srv *Server) SetShutdownWaits(preWait, postWait, timeout time.Duration) *S
 }
 
 // Start 初始化各种插件
+// Serve preserves process signals while sharing Start/Stop resource ownership.
 func (srv *Server) Serve() error {
-	tag := "rpcxServe"
-	ctx := context.Background()
-
-	// init rpc server
-	srv.server = server.NewServer()
-
-	// before func
-	for _, fn := range srv.beforeFuncs {
-		err := fn()
-		if err != nil {
-			return err
-		}
+	if err := srv.Start(context.Background()); err != nil {
+		return err
 	}
-
-	// 统一信号处理
-	signal.Notify(srv.sigChan,
-		syscall.SIGHUP,
-		syscall.SIGINT,
-		syscall.SIGTERM,
-		syscall.SIGQUIT)
-
-	go srv.handleSignals()
-
-	logger.Ix(ctx, tag, fmt.Sprintf("server start listen on %s@%s:%s", srv.Opts.Network, srv.Opts.Addr, srv.Opts.Port))
-
-	server.WithReadTimeout(srv.Opts.ReadTimeout)(srv.server)
-	server.WithWriteTimeout(srv.Opts.WriteTimeout)(srv.server)
-	err := srv.server.Serve(srv.Opts.Network, srv.Opts.Addr+":"+srv.Opts.Port)
-
-	if err != nil && !isShutdownError(err) {
-		logger.Ex(ctx, tag, "server error", "error", err.Error())
-	} else {
-		err = nil
+	signal.Notify(srv.sigChan, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(srv.sigChan)
+	done := make(chan error, 1)
+	go func() { done <- srv.Wait() }()
+	var err error
+	select {
+	case err = <-done:
+	case <-srv.sigChan:
 	}
-
-	// 等待关闭完成后执行清理函数
+	ctx, cancel := context.WithTimeout(context.Background(), srv.shutdownTimeout)
+	defer cancel()
+	err = errors.Join(err, srv.Stop(ctx))
 	for _, fn := range srv.afterFuncs {
 		fn()
 	}
-
 	return err
 }
 
@@ -407,6 +392,11 @@ func (srv *Server) Server() *server.Server {
 
 // Shutdown 主动触发平滑关闭（用于程序主动关闭场景）
 func (srv *Server) Shutdown() error {
+	if atomic.LoadInt32(&srv.runStarted) > 0 {
+		ctx, cancel := context.WithTimeout(context.Background(), srv.shutdownTimeout)
+		defer cancel()
+		return srv.Stop(ctx)
+	}
 	srv.gracefulShutdown()
 	return nil
 }
@@ -436,31 +426,7 @@ func (srv *Server) InitRpcxAuth(fns ...ValidAccess) bootstrap.BeforeServerStartF
 
 // InitRpcxAuthWithOptions snapshots the caller's authorization map before use.
 func (srv *Server) InitRpcxAuthWithOptions(values map[string]string, fns ...ValidAccess) bootstrap.BeforeServerStartFunc {
-	copied := make(map[string]string, len(values))
-	for key, value := range values {
-		copied[key] = value
-	}
-
-	return func() error {
-		var initErr error
-		srv.authInitialized.Do(func() {
-			srv.authMu.Lock()
-			srv.validAuth = copied
-			srv.server.AuthFunc = func(ctx context.Context, req *protocol.Message, token string) error {
-				return srv.auth(ctx, req, token)
-			}
-			if len(fns) > 0 {
-				srv.accessFn = fns[0]
-			} else {
-				srv.accessFn = srv.validAuthAccess
-			}
-			srv.authMu.Unlock()
-
-			// 启动 nonce 清理协程
-			srv.startNonceCleanup()
-		})
-		return initErr
-	}
+	return srv.InitRpcxAuthV2(values, AuthOptions{}, fns...)
 }
 
 // auth 执行 RPC 鉴权
@@ -468,60 +434,28 @@ func (srv *Server) InitRpcxAuthWithOptions(values map[string]string, fns ...Vali
 // 1. 新安全模式（推荐）: 需要 X-Auth-AppId, X-Auth-Timestamp, X-Auth-Nonce, X-Auth-Sign
 // 2. 兼容模式: 使用 token 参数（已废弃，保留向后兼容）
 func (srv *Server) auth(ctx context.Context, req *protocol.Message, token string) error {
-	// 优先从 Metadata 获取 appId
-	appId, ok := req.Metadata["X-Auth-AppId"]
-	if !ok {
-		// 向后兼容：使用 token 参数
-		if token == "" {
-			return errors.New("missing X-Auth-AppId")
-		}
-		appId = token
+	app := req.Metadata["X-Auth-AppId"]
+	if len(app) > 128 {
+		return errors.New("rpcxauth: invalid appId")
 	}
-
 	srv.authMu.RLock()
 	fn := srv.accessFn
+	policy := srv.authV2
 	srv.authMu.RUnlock()
-
-	key, ok := fn(appId)
-	if !ok {
-		return errors.New("invalid appId")
+	if fn == nil {
+		return errors.New("rpcxauth: not configured")
 	}
-
-	timestamp, ok := req.Metadata["X-Auth-Timestamp"]
-	if !ok {
-		// 向后兼容：尝试旧的时间戳 key
-		timestamp, ok = req.Metadata["X-Auth-TimeStamp"]
-		if !ok {
-			return errors.New("invalid timestamp")
-		}
+	key, ok := fn(app)
+	if !ok || key == "" {
+		return errors.New("rpcxauth: invalid appId")
 	}
-
-	if !srv.checkTimestamp(cast.ToInt64(timestamp)) {
-		return errors.New("expired timestamp")
-	}
-
-	// 获取 nonce（新安全模式必需）
-	nonce, hasNonce := req.Metadata["X-Auth-Nonce"]
-
-	sign, ok := req.Metadata["X-Auth-Sign"]
-	if !ok {
-		return errors.New("invalid sign")
-	}
-
-	// 根据是否有 nonce 选择校验方式
-	if hasNonce {
-		// 新安全模式: HMAC-SHA256 + nonce
-		if !srv.checkNonce(appId, key, timestamp, nonce, sign) {
-			return errors.New("check sign fail")
-		}
+	domain := policy.Domain
+	if domain == "" {
+		domain = req.ServicePath
 	} else {
-		// 向后兼容模式: MD5（不推荐）
-		logger.Wx(ctx, "auth", "using deprecated MD5 auth", "appId", appId)
-		if !checkLegacy(appId, key, timestamp, sign) {
-			return errors.New("check sign fail")
-		}
+		domain += "/" + req.ServicePath
 	}
-	return nil
+	return rpcxauth.Verify(ctx, req, key, domain, policy.MaxClockSkew, policy.ReplayStore)
 }
 
 // checkTimestamp 检查时间戳是否在有效范围内
@@ -640,14 +574,47 @@ func (srv *Server) stopNonceCleanup() {
 
 // Start initializes RPC and binds before reporting readiness. No signals are
 // registered on this path; the application owns cancellation and Stop.
-func (srv *Server) Start(ctx context.Context) error {
+func (srv *Server) Start(parent context.Context) (err error) {
+	srv.lifeMu.Lock()
+	if srv.lifeClosed {
+		srv.lifeMu.Unlock()
+		return errors.New("rpcxserver: closed")
+	}
+	if !atomic.CompareAndSwapInt32(&srv.runStarted, 0, 1) {
+		srv.lifeMu.Unlock()
+		return errors.New("rpcxserver: already started")
+	}
+	ctx, cancel := context.WithCancel(parent)
+	srv.startCancel = cancel
+	srv.startDone = make(chan struct{})
+	srv.lifeMu.Unlock()
+	defer cancel()
+	defer func() {
+		if panicValue := recover(); panicValue != nil {
+			err = fmt.Errorf("rpcxserver: startup panic (%T)", panicValue)
+		}
+		srv.lifeMu.Lock()
+		if srv.lifeClosed && err == nil {
+			err = context.Canceled
+		}
+		srv.lifeMu.Unlock()
+		if err != nil && srv.listener != nil {
+			srv.listener.Close()
+			srv.server.Close()
+		}
+		srv.lifeMu.Lock()
+		srv.startErr = err
+		close(srv.startDone)
+		srv.lifeMu.Unlock()
+	}()
+
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if !atomic.CompareAndSwapInt32(&srv.runStarted, 0, 1) {
-		return errors.New("rpcxserver: already started")
-	}
 	srv.server = server.NewServer()
+	srv.server.DisableHTTPGateway = true
+	srv.server.DisableJSONRPC = true
+	srv.server.Plugins.Add(muxBudget{srv.Opts.ReadTimeout})
 	for _, fn := range srv.beforeFuncs {
 		if err := fn(); err != nil {
 			return err
@@ -659,7 +626,7 @@ func (srv *Server) Start(ctx context.Context) error {
 	if listenNetwork == "http" {
 		listenNetwork = "tcp"
 	}
-	listener, err := net.Listen(listenNetwork, net.JoinHostPort(srv.Opts.Addr, srv.Opts.Port))
+	listener, err := (&net.ListenConfig{}).Listen(ctx, listenNetwork, net.JoinHostPort(srv.Opts.Addr, srv.Opts.Port))
 	if err != nil {
 		return err
 	}
@@ -694,14 +661,28 @@ func (srv *Server) Start(ctx context.Context) error {
 
 }
 func (srv *Server) Wait() error {
-	if srv.runDone == nil {
+	srv.lifeMu.Lock()
+	started := srv.startDone
+	srv.lifeMu.Unlock()
+	if started == nil {
 		return errors.New("rpcxserver: not started")
+	}
+	<-started
+	if srv.startErr != nil {
+		return srv.startErr
 	}
 	<-srv.runDone
 	return srv.runErr
 }
 func (srv *Server) Stop(ctx context.Context) error {
-	if srv.server == nil {
+	srv.lifeMu.Lock()
+	srv.lifeClosed = true
+	started, cancel := srv.startDone, srv.startCancel
+	srv.lifeMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	if started == nil {
 		return nil
 	}
 	srv.shutdownOnce.Do(func() {
@@ -711,10 +692,17 @@ func (srv *Server) Stop(ctx context.Context) error {
 			defer srv.stopNonceCleanup()
 			defer func() {
 				if p := recover(); p != nil {
-					srv.runStopErr = errors.Join(srv.runStopErr, fmt.Errorf("rpcxserver stop panic: %v", p))
+					srv.runStopErr = errors.Join(srv.runStopErr, fmt.Errorf("rpcxserver stop panic (%T)", p))
 				}
 			}()
+			<-started
+			if srv.server == nil {
+				return
+			}
 			srv.runStopErr = srv.server.Shutdown(ctx)
+			if srv.runStopErr != nil {
+				srv.runStopErr = errors.Join(srv.runStopErr, srv.server.Close())
+			}
 			if srv.runDone != nil {
 				<-srv.runDone
 			}

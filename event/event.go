@@ -41,6 +41,7 @@ func (this *Event) Clone() *Event {
 	e := new(Event)
 	e.Type = this.Type
 	e.Target = this.Target
+	e.Object = this.Object
 	return e
 }
 

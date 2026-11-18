@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/natefinch/lumberjack"
@@ -12,6 +13,7 @@ import (
 )
 
 type builder struct {
+	metadataMu sync.RWMutex
 	env        string
 	name       string
 	version    string
@@ -21,18 +23,26 @@ type builder struct {
 }
 
 func (t *builder) SetEnv(env string) {
+	t.metadataMu.Lock()
+	defer t.metadataMu.Unlock()
 	t.env = env
 }
 
 func (t *builder) SetName(name string) {
+	t.metadataMu.Lock()
+	defer t.metadataMu.Unlock()
 	t.name = name
 }
 
 func (t *builder) SetVersion(version string) {
+	t.metadataMu.Lock()
+	defer t.metadataMu.Unlock()
 	t.version = version
 }
 
 func (t *builder) SetDepartment(department string) {
+	t.metadataMu.Lock()
+	defer t.metadataMu.Unlock()
 	t.department = department
 }
 

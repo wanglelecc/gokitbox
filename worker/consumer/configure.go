@@ -71,6 +71,7 @@ type RabbitmqConfig struct {
 
 // redis config
 type RedisConfig struct {
+	DeliveryMode  string `json:"deliveryMode" yaml:"deliveryMode"`
 	ConsumerCount int    `json:"consumerCount" yaml:"consumerCount"`
 	Addr          string `json:"addr" yaml:"addr"`
 	Username      string `json:"username" yaml:"username"`
@@ -85,6 +86,7 @@ type RedisConfig struct {
 
 // delay config
 type DelayConfig struct {
+	DeliveryMode  string `json:"deliveryMode" yaml:"deliveryMode"`
 	ConsumerCount int    `json:"consumerCount" yaml:"consumerCount"`
 	Addr          string `json:"addr" yaml:"addr"`
 	Username      string `json:"username" yaml:"username"`
@@ -201,7 +203,7 @@ func (c *Configure) Validate() error {
 			return fmt.Errorf("worker: redis consumers are required")
 		}
 		for _, v := range c.Redis {
-			if v == nil || v.Addr == "" || v.Queue == "" || v.ConsumerCount <= 0 || v.Db < 0 || v.FailCount < 0 {
+			if v == nil || v.Addr == "" || v.Queue == "" || v.ConsumerCount <= 0 || v.Db < 0 || v.FailCount < 0 || (v.DeliveryMode != "" && v.DeliveryMode != "reliable" && v.DeliveryMode != "legacy") || (v.FailQueue != "" && v.FailQueue == v.Queue) {
 				return fmt.Errorf("worker: invalid redis consumer")
 			}
 		}
@@ -211,7 +213,7 @@ func (c *Configure) Validate() error {
 			return fmt.Errorf("worker: delay consumers are required")
 		}
 		for _, v := range c.Delay {
-			if v == nil || v.Addr == "" || v.Queue == "" || v.ConsumerCount <= 0 || v.Db < 0 || v.FailCount < 0 {
+			if v == nil || v.Addr == "" || v.Queue == "" || v.ConsumerCount <= 0 || v.Db < 0 || v.FailCount < 0 || (v.DeliveryMode != "" && v.DeliveryMode != "reliable" && v.DeliveryMode != "legacy") || (v.FailQueue != "" && v.FailQueue == v.Queue) {
 				return fmt.Errorf("worker: invalid delay consumer")
 			}
 		}

@@ -27,4 +27,3 @@ func RequestHeader() gin.HandlerFunc {
 		c.Next()
 	}
 }
-

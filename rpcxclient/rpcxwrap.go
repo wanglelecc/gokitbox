@@ -3,7 +3,6 @@ package rpcxclient
 import (
 	"context"
 	"errors"
-	"fmt"
 	"time"
 
 	"github.com/smallnest/rpcx/client"
@@ -51,6 +50,7 @@ type DefaultWrap struct {
 type WrapOptions struct {
 	AppId, AppKey string
 	CallTimeout   time.Duration
+	Domain        string
 }
 
 func NewDefaultWrapWithOptions(serviceName string, o WrapOptions) (RpcxWrap, error) {
@@ -83,7 +83,7 @@ func (d *DefaultWrap) WrapCall(c client.XClient, ctx context.Context, serviceMet
 	tag := d.serviceName + "." + serviceMethod
 	if skip := ctx.Value(CtxKeySkipLog); skip == nil {
 		defer func() {
-			logger.Ix(ctx, tag, fmt.Sprintf("[destinationAddr:%s], WrapCall args:[%+v],reply:[%+v]", d.getServerAddr(ctx), args, reply))
+			logger.Ix(ctx, tag, "rpc completed")
 		}()
 	}
 
@@ -107,28 +107,17 @@ func (d *DefaultWrap) WrapCall(c client.XClient, ctx context.Context, serviceMet
 		metadata["trace_id"] = cast.ToString(ctx.Value(CtxKeyLogID))
 	}
 
-	// 鉴权信息生成
-	if cast.ToString(ctx.Value(CtxKeyRPCXAppId)) != "" {
-		// 使用上下文传入的自定义鉴权信息
-		metadata[AuthHeaderAppId] = cast.ToString(ctx.Value(CtxKeyRPCXAppId))
-		metadata[AuthHeaderTimestamp] = cast.ToString(ctx.Value(CtxKeyRPCXTimestamp))
-		metadata[AuthHeaderSign] = cast.ToString(ctx.Value(CtxKeyRPCXSign))
-	} else if authAppId != "" && authAppKey != "" {
-		// 使用全局配置的鉴权
-		if d.useNewAuth {
-			// 新的 HMAC-SHA256 + nonce 鉴权
-			timestamp, nonce, sign := genRpcAuthCtx(authAppId, authAppKey)
-			metadata[AuthHeaderAppId] = authAppId
-			metadata[AuthHeaderTimestamp] = timestamp
-			metadata[AuthHeaderNonce] = nonce
-			metadata[AuthHeaderSign] = sign
-		} else {
-			// 兼容旧的 MD5 鉴权（已废弃）
-			timestamp, sign := genRpcAuthCtxLegacy(authAppId, authAppKey)
-			metadata[AuthHeaderTimestamp] = timestamp
-			metadata[AuthHeaderSign] = sign
-		}
+	domain := d.serviceName
+	if d.options != nil && d.options.Domain != "" {
+		domain = d.options.Domain + "/" + d.serviceName
 	}
+	if d.options == nil && authDomain != "" {
+		domain = authDomain + "/" + d.serviceName
+	}
+	if err := InstallAuth(c, authAppId, authAppKey, domain); err != nil {
+		return err
+	}
+	// Signing takes place after serialization, immediately before wire encoding.
 
 	ctx = context.WithValue(ctx, share.ReqMetaDataKey, metadata)
 

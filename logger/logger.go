@@ -149,3 +149,6 @@ func FatalF(ctx context.Context, tag string, message string, fields ...interface
 func PanicF(ctx context.Context, tag string, message string, fields ...interface{}) {
 	stdBuilder.LoggerF(ctx, "PANIC", tag, message, fields...)
 }
+
+// Close releases the owned file sink; late logs go to a no-op logger.
+func Close() error { return stdBuilder.Close() }

@@ -1995,55 +1995,14 @@ func (r *Redis) SetJSON(ctx context.Context, key string, value interface{}, expi
 
 // ==================== 分布式锁 ====================
 
-// TryLock 尝试获取分布式锁
-// 使用 SetNX 实现，锁的 value 包含时间戳信息
-// 注意：这是简单实现，生产环境建议使用 Redlock 或类似方案
-//
-// @param ctx: 上下文，用于控制超时和取消
-// @param key: 锁的键名
-// @param expiration: 锁的过期时间，必须设置以防止死锁
-//
-// @return bool: 获取成功返回 true，锁已被占用返回 false
-// @return error: 错误信息
-//
-// 使用示例：
-//
-//	// 尝试获取锁，30 秒后自动释放
-//	ok, err := rdb.TryLock(ctx, "lock:order:123", 30*time.Second)
-//	if err != nil {
-//	    log.Fatal(err)
-//	}
-//	if ok {
-//	    // 获取锁成功
-//	    defer rdb.Unlock(ctx, "lock:order:123") // 确保释放锁
-//	    // 执行业务逻辑
-//	} else {
-//	    // 锁已被占用
-//	}
+// TryLock is retired: use Acquire and release the returned owner Lease.
 func (r *Redis) TryLock(ctx context.Context, key string, expiration time.Duration) (bool, error) {
-	// 使用唯一标识作为 value，便于后续释放时验证
-	value := fmt.Sprintf("%d-%d", time.Now().UnixNano(), time.Now().Unix())
-	ok, err := r.client.SetNX(ctx, key, value, expiration).Result()
-	if err != nil {
-		return false, err
-	}
-	return ok, nil
+	return false, errors.New("redis: TryLock retired; use Acquire and Lease.Release")
 }
 
-// Unlock 释放锁（简单实现，不验证 value）
-// 警告：此方法会强制删除 key，如果锁已过期被其他客户端获取，会导致误删
-// 生产环境建议使用 Lua 脚本验证 value 后再删除
-//
-// @param ctx: 上下文，用于控制超时和取消
-// @param key: 锁的键名
-//
-// @return error: 错误信息
-//
-// 使用示例：
-//
-//	err := rdb.Unlock(ctx, "lock:order:123")
+// Deprecated: release the Lease returned by Acquire.
 func (r *Redis) Unlock(ctx context.Context, key string) error {
-	return r.Del(ctx, key)
+	return errors.New("redis: ownerless Unlock retired; use Lease.Release")
 }
 
 // ==================== 批量操作 ====================

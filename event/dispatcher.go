@@ -1,63 +1,60 @@
 package event
 
-// 事件调度器基类
+import "sync"
+
+type listenerEntry struct {
+	identity *EventListener
+	handler  EventHandler
+}
 type EventDispatcher struct {
-	savers []*EventSaver
+	mu        sync.RWMutex
+	listeners map[string][]listenerEntry
 }
 
-// 创建事件派发器
 func NewEventDispatcher() *EventDispatcher {
-	return new(EventDispatcher)
+	return &EventDispatcher{listeners: map[string][]listenerEntry{}}
 }
-
-// 事件调度器添加事件
-func (this *EventDispatcher) AddEventListener(eventType string, listener *EventListener) {
-	for _, saver := range this.savers {
-		if saver.Type == eventType {
-			saver.Listeners = append(saver.Listeners, listener)
-			return
-		}
+func (d *EventDispatcher) AddEventListener(kind string, l *EventListener) {
+	if l == nil || l.Handler == nil {
+		return
 	}
-
-	saver := &EventSaver{Type: eventType, Listeners: []*EventListener{listener}}
-	this.savers = append(this.savers, saver)
-}
-
-// 事件调度器移除某个监听
-func (this *EventDispatcher) RemoveEventListener(eventType string, listener *EventListener) bool {
-	for _, saver := range this.savers {
-		if saver.Type == eventType {
-			for i, l := range saver.Listeners {
-				if listener == l {
-					saver.Listeners = append(saver.Listeners[:i], saver.Listeners[i+1:]...)
-					return true
-				}
-			}
-		}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.listeners == nil {
+		d.listeners = map[string][]listenerEntry{}
 	}
-	return false
+	d.listeners[kind] = append(d.listeners[kind], listenerEntry{l, l.Handler})
 }
-
-// 事件调度器是否包含某个类型的监听
-func (this *EventDispatcher) HasEventListener(eventType string) bool {
-	for _, saver := range this.savers {
-		if saver.Type == eventType {
-			return true
-		}
-	}
-	return false
-}
-
-// 事件调度器派发事件
-func (this *EventDispatcher) DispatchEvent(event Event) bool {
-	for _, saver := range this.savers {
-		if saver.Type == event.Type {
-			for _, listener := range saver.Listeners {
-				event.Target = this
-				listener.Handler(event)
+func (d *EventDispatcher) RemoveEventListener(kind string, l *EventListener) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	ls := d.listeners[kind]
+	for i, v := range ls {
+		if v.identity == l {
+			d.listeners[kind] = append(ls[:i], ls[i+1:]...)
+			if len(d.listeners[kind]) == 0 {
+				delete(d.listeners, kind)
 			}
 			return true
 		}
 	}
 	return false
+}
+func (d *EventDispatcher) HasEventListener(kind string) bool {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	return len(d.listeners[kind]) > 0
+}
+func (d *EventDispatcher) DispatchEvent(e Event) bool {
+	d.mu.RLock()
+	callbacks := make([]EventHandler, 0, len(d.listeners[e.Type]))
+	for _, l := range d.listeners[e.Type] {
+		callbacks = append(callbacks, l.handler)
+	}
+	d.mu.RUnlock()
+	e.Target = d
+	for _, fn := range callbacks {
+		fn(e)
+	}
+	return len(callbacks) > 0
 }

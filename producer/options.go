@@ -15,8 +15,8 @@ type Options struct {
 }
 
 func (o Options) Validate() error {
-	if o.BufferLimit < 0 {
-		return errors.New("producer: negative buffer limit")
+	if o.BufferLimit < 0 || o.BufferLimit > 1000000 {
+		return errors.New("producer: buffer limit out of range")
 	}
 	if o.KafkaEnabled {
 		return o.Kafka.Validate()
@@ -45,7 +45,9 @@ func currentOptions() Options {
 	optionsMu.Lock()
 	defer optionsMu.Unlock()
 	if configuredOptions != nil {
-		return *configuredOptions
+		o := *configuredOptions
+		o.Kafka.Brokers = append([]string(nil), o.Kafka.Brokers...)
+		return o
 	}
 	return legacyOptions()
 }

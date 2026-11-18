@@ -2,8 +2,10 @@ package logger
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
+	"sync"
 
 	"github.com/natefinch/lumberjack"
 
@@ -26,16 +28,30 @@ var encoderConfig = zapcore.EncoderConfig{
 }
 
 type zapBuilder struct {
+	mu sync.RWMutex
 	builder
 	zapLogger *zap.Logger
 	logWriter *lumberjack.Logger
 }
 
 func NewZapBuilder(logger *zap.Logger) *zapBuilder {
+	if logger == nil {
+		logger = zap.NewNop()
+	}
 	return &zapBuilder{zapLogger: logger}
 }
 
 func (log *zapBuilder) LoadConfig(config *Config) {
+	log.mu.Lock()
+	defer log.mu.Unlock()
+	log.metadataMu.RLock()
+	defer log.metadataMu.RUnlock()
+	oldWriter := log.logWriter
+	defer func() {
+		if oldWriter != nil {
+			oldWriter.Close()
+		}
+	}()
 	var lvl zapcore.Level
 	switch config.Level {
 	case "DEBUG":
@@ -95,6 +111,8 @@ func (log *zapBuilder) LoggerF(ctx context.Context, lvl string, tag string, mess
 }
 
 func (log *zapBuilder) LoggerW(ctx context.Context, mod bool, lvl string, tag string, message string, fields ...interface{}) {
+	log.mu.RLock()
+	defer log.mu.RUnlock()
 	if tag == "" {
 		tag = "NoTagError"
 	}
@@ -129,10 +147,27 @@ func (log *zapBuilder) LoggerW(ctx context.Context, mod bool, lvl string, tag st
 }
 
 func (log *zapBuilder) Sync() error {
+	log.mu.RLock()
+	defer log.mu.RUnlock()
 	err := log.zapLogger.Sync()
 	// if log.logWriter != nil {
 	//	log.logWriter.Rotate()
 	// }
 
+	return err
+}
+
+type consoleOutput struct{}
+
+func (consoleOutput) Write(b []byte) (int, error) { return os.Stdout.Write(b) }
+func (log *zapBuilder) Close() error {
+	log.mu.Lock()
+	defer log.mu.Unlock()
+	err := log.zapLogger.Sync()
+	log.zapLogger = zap.NewNop()
+	if log.logWriter != nil {
+		err = errors.Join(err, log.logWriter.Close())
+		log.logWriter = nil
+	}
 	return err
 }

@@ -16,6 +16,7 @@ import (
 )
 
 var (
+	authDomain         string
 	sAddress           []string // 注册中心地址
 	username           string   // 用户名
 	password           string   // 密码
@@ -32,6 +33,7 @@ var (
 
 // Options are supplied after the application's configuration has been loaded.
 type Options struct {
+	AuthDomain                                                 string
 	Addrs                                                      []string
 	Username, Password, Bucket, BasePath, Group, AppId, AppKey string
 	CallTimeout, ConnectTimeout                                time.Duration
@@ -55,6 +57,7 @@ func InitWithOptions(o Options) error {
 	if configInitialized {
 		return errors.New("rpcxclient: already initialized; recreate clients to change options")
 	}
+	authDomain = o.AuthDomain
 	sAddress = append([]string(nil), o.Addrs...)
 	username = o.Username
 	password = o.Password

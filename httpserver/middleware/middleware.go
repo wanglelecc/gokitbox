@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"net/http/httputil"
 	"runtime/debug"
 	"strconv"
 
@@ -79,18 +78,8 @@ func Recovery() gin.HandlerFunc {
 		defer func() {
 			if err := recover(); err != nil {
 				stack := debug.Stack()
-				httpRequest, dumpErr := httputil.DumpRequest(c.Request, false)
-				httpRequestStr := string(httpRequest)
-				if dumpErr != nil {
-					httpRequestStr = fmt.Sprintf("dump error: %v", dumpErr)
-				}
 				ctx := transferToContext(c)
-				logger.Ex(ctx, "recovery", "http request panic recovered error",
-					"request_url", c.Request.RequestURI,
-					"http_request", httpRequestStr,
-					"error", fmt.Sprintf("%v", err),
-					"stacks", string(stack),
-				)
+				logger.Ex(ctx, "recovery", "http panic recovered", "route", c.FullPath(), "panic_type", fmt.Sprintf("%T", err), "stacks", string(stack))
 				c.AbortWithStatus(500)
 			}
 		}()

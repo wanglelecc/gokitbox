@@ -153,6 +153,9 @@ func (r *RedisConsumer) consume(client *redis.Client, config *RedisConfig) {
 // doConsume 单次消费生命周期
 // 返回 true 表示收到 quit 信号，正常退出；false 表示异常，外层需重启
 func (r *RedisConsumer) doConsume(ctx context.Context, client *redis.Client, config *RedisConfig, bo *backoff) (exitClean bool) {
+	if config.DeliveryMode != "legacy" {
+		return r.runtime.consumeReliable(ctx, r.quit, client, config.Queue, "list", config.FailQueue, config.FailCount, config.TplName, r.callback, &r.successCount, &r.errorCount)
+	}
 	defer func() {
 		if p := recover(); p != nil {
 			atomic.AddInt64(&r.panicCount, 1)

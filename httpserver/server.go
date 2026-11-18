@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -21,6 +22,14 @@ import (
 )
 
 type Server struct {
+	stopOnce        sync.Once
+	stopDone        chan struct{}
+	stopErr         error
+	lifeMu          sync.Mutex
+	lifeClosed      bool
+	startDone       chan struct{}
+	startErr        error
+	startCancel     context.CancelFunc
 	server          *http.Server
 	engine          *gin.Engine // 直接持有 Engine，避免 Handler 字段类型断言
 	beforeFuncs     []bootstrap.BeforeServerStartFunc
@@ -102,6 +111,9 @@ func NewServerWithOptions(opts ServerOptions) (*Server, error) {
 	}
 
 	s.engine = gin.New()
+	if err := s.engine.SetTrustedProxies(nil); err != nil {
+		return nil, fmt.Errorf("httpserver: trusted proxies: %w", err)
+	}
 
 	readHeaderTimeout, err := opts.GetReadHeaderTimeout()
 	if err != nil {
@@ -134,43 +146,27 @@ func NewServerWithOptions(opts ServerOptions) (*Server, error) {
 	return s, nil
 }
 
+// Serve is the signal-owning compatibility wrapper around the same lifecycle.
 func (s *Server) Serve() error {
-	if !atomic.CompareAndSwapInt32(&s.served, 0, 1) {
-		return fmt.Errorf("httpserver: Serve already called, Server is not reusable")
-	}
-
-	for _, fn := range s.beforeFuncs {
-		if err := fn(); err != nil {
-			return err
-		}
-	}
-
-	quit := make(chan struct{})
-	signal.Notify(s.sigChan, os.Interrupt, syscall.SIGTERM)
-	defer signal.Stop(s.sigChan)
-
-	go s.waitShutdown(quit)
-	logger.Ix(context.Background(), "httpserver", fmt.Sprintf("httpserver start and serve:%s", s.server.Addr))
-
-	if err := s.server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		// 启动失败（如端口被占用），通知 waitShutdown 退出
-		close(quit)
-		// 等待 waitShutdown goroutine 完全退出，确保 Serve() 返回前无悬挂 goroutine
-		<-s.shutdownDone
-		for _, fn := range s.afterFuncs {
-			fn()
-		}
+	if err := s.Start(context.Background()); err != nil {
 		return err
 	}
-
-	// 等待优雅关闭完成
-	<-s.shutdownDone
-
+	signal.Notify(s.sigChan, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(s.sigChan)
+	done := make(chan error, 1)
+	go func() { done <- s.Wait() }()
+	var err error
+	select {
+	case err = <-done:
+	case <-s.sigChan:
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(atomic.LoadInt64(&s.shutdownTimeout)))
+	defer cancel()
+	err = errors.Join(err, s.Stop(ctx))
 	for _, fn := range s.afterFuncs {
 		fn()
 	}
-
-	return nil
+	return err
 }
 
 func (s *Server) waitShutdown(quit <-chan struct{}) {
@@ -296,19 +292,44 @@ func (s *Server) InitConfig(ops ...string) error {
 
 // Start binds synchronously and launches serving without owning OS signals.
 // The context bounds startup only; Stop owns graceful termination.
-func (s *Server) Start(ctx context.Context) error {
-	if err := ctx.Err(); err != nil {
+func (s *Server) Start(parent context.Context) (err error) {
+	s.lifeMu.Lock()
+	if s.lifeClosed || !atomic.CompareAndSwapInt32(&s.served, 0, 1) {
+		s.lifeMu.Unlock()
+		return errors.New("httpserver: already started or closed")
+	}
+	ctx, cancel := context.WithCancel(parent)
+	s.startCancel = cancel
+	s.startDone = make(chan struct{})
+	s.lifeMu.Unlock()
+	defer cancel()
+	defer func() {
+		if panicValue := recover(); panicValue != nil {
+			err = fmt.Errorf("httpserver: startup panic (%T)", panicValue)
+		}
+		s.lifeMu.Lock()
+		if s.lifeClosed && err == nil {
+			err = context.Canceled
+		}
+		s.lifeMu.Unlock()
+		if err != nil && s.runListener != nil {
+			s.runListener.Close()
+			s.server.Close()
+		}
+		s.lifeMu.Lock()
+		s.startErr = err
+		close(s.startDone)
+		s.lifeMu.Unlock()
+	}()
+	if err = ctx.Err(); err != nil {
 		return err
 	}
-	if !atomic.CompareAndSwapInt32(&s.served, 0, 1) {
-		return fmt.Errorf("httpserver: already started")
-	}
 	for _, fn := range s.beforeFuncs {
-		if err := fn(); err != nil {
+		if err = fn(); err != nil {
 			return err
 		}
 	}
-	listener, err := net.Listen("tcp", s.server.Addr)
+	listener, err := (&net.ListenConfig{}).Listen(ctx, "tcp", s.server.Addr)
 	if err != nil {
 		return err
 	}
@@ -325,21 +346,50 @@ func (s *Server) Start(ctx context.Context) error {
 	return nil
 }
 func (s *Server) Wait() error {
-	if s.runDone == nil {
-		return fmt.Errorf("httpserver: not started")
+	s.lifeMu.Lock()
+	started := s.startDone
+	s.lifeMu.Unlock()
+	if started == nil {
+		return errors.New("httpserver: not started")
+	}
+	<-started
+	if s.startErr != nil {
+		return s.startErr
 	}
 	<-s.runDone
 	return s.runErr
 }
 func (s *Server) Stop(ctx context.Context) error {
-	if s.runListener == nil {
+	s.lifeMu.Lock()
+	s.lifeClosed = true
+	started, cancel := s.startDone, s.startCancel
+	s.lifeMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	if started == nil {
 		return nil
 	}
-	stopCtx, cancel := context.WithTimeout(ctx, time.Duration(atomic.LoadInt64(&s.shutdownTimeout)))
-	defer cancel()
-	err := s.server.Shutdown(stopCtx)
-	if err != nil {
-		return errors.Join(err, s.server.Close())
+	s.stopOnce.Do(func() {
+		s.stopDone = make(chan struct{})
+		go func() {
+			defer close(s.stopDone)
+			<-started
+			if s.runListener == nil {
+				return
+			}
+			stopCtx, cancel := context.WithTimeout(ctx, time.Duration(atomic.LoadInt64(&s.shutdownTimeout)))
+			defer cancel()
+			s.stopErr = s.server.Shutdown(stopCtx)
+			if s.stopErr != nil {
+				s.stopErr = errors.Join(s.stopErr, s.server.Close())
+			}
+		}()
+	})
+	select {
+	case <-s.stopDone:
+		return s.stopErr
+	case <-ctx.Done():
+		return ctx.Err()
 	}
-	return nil
 }

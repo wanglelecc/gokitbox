@@ -9,6 +9,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"io"
+	"net/url"
 	"os"
 	"sort"
 	"strings"
@@ -129,7 +130,7 @@ func HmacSHA256(s, key string) string {
 func Guid() string {
 	b := make([]byte, 48)
 	if _, err := io.ReadFull(rand.Reader, b); err != nil {
-		return ""
+		panic(err)
 	}
 	return MD5(base64.URLEncoding.EncodeToString(b))
 }
@@ -142,7 +143,7 @@ func Guid() string {
 //	params := map[string]string{"b": "2", "a": "1", "sign": "xxx"}
 //	sig := uHash.SignByAscii(params, "my_secret", "sign")
 //	// sig = HMAC-SHA256("a=1&b=2", "my_secret")，返回 64 位十六进制字符串
-func SignByAscii(params map[string]string, secret string, exceptKeys ...string) string {
+func SignLegacyByAscii(params map[string]string, secret string, exceptKeys ...string) string {
 	excluded := make(map[string]struct{}, len(exceptKeys))
 	for _, k := range exceptKeys {
 		excluded[k] = struct{}{}
@@ -167,4 +168,24 @@ func SignByAscii(params map[string]string, secret string, exceptKeys ...string) 
 	}
 
 	return HmacSHA256(sb.String(), secret)
+}
+
+// SignV2 uses percent-escaped, sorted keys and values; the v2 prefix separates protocols.
+func SignV2(params map[string]string, secret string, exceptKeys ...string) string {
+	excluded := map[string]bool{}
+	for _, k := range exceptKeys {
+		excluded[k] = true
+	}
+	values := url.Values{}
+	for k, v := range params {
+		if !excluded[k] {
+			values.Set(k, v)
+		}
+	}
+	return HmacSHA256("v2\n"+values.Encode(), secret)
+}
+
+// SignByAscii now uses the unambiguous v2 contract. Legacy protocols must opt in by name.
+func SignByAscii(params map[string]string, secret string, exceptKeys ...string) string {
+	return SignV2(params, secret, exceptKeys...)
 }

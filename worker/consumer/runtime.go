@@ -18,15 +18,19 @@ import (
 type ContextConsumeCallback func(context.Context, string, string, []byte) (bool, error)
 
 type RuntimeOptions struct {
-	HandlerTimeout   time.Duration `json:"handlerTimeout" yaml:"handlerTimeout"`
-	RetryDelay       time.Duration `json:"retryDelay" yaml:"retryDelay"`
-	DeliveryTimeout  time.Duration `json:"deliveryTimeout" yaml:"deliveryTimeout"`
-	OperationTimeout time.Duration `json:"operationTimeout" yaml:"operationTimeout"`
-	SessionTimeout   time.Duration `json:"sessionTimeout" yaml:"sessionTimeout"`
-	MaxPollInterval  time.Duration `json:"maxPollInterval" yaml:"maxPollInterval"`
+	VisibilityTimeout time.Duration `json:"visibilityTimeout" yaml:"visibilityTimeout"`
+	HandlerTimeout    time.Duration `json:"handlerTimeout" yaml:"handlerTimeout"`
+	RetryDelay        time.Duration `json:"retryDelay" yaml:"retryDelay"`
+	DeliveryTimeout   time.Duration `json:"deliveryTimeout" yaml:"deliveryTimeout"`
+	OperationTimeout  time.Duration `json:"operationTimeout" yaml:"operationTimeout"`
+	SessionTimeout    time.Duration `json:"sessionTimeout" yaml:"sessionTimeout"`
+	MaxPollInterval   time.Duration `json:"maxPollInterval" yaml:"maxPollInterval"`
 }
 
 func (o RuntimeOptions) defaults() RuntimeOptions {
+	if o.VisibilityTimeout == 0 {
+		o.VisibilityTimeout = max(30*time.Second, 3*o.OperationTimeout)
+	}
 	if o.HandlerTimeout == 0 {
 		o.HandlerTimeout = 30 * time.Second
 	}
@@ -48,10 +52,13 @@ func (o RuntimeOptions) defaults() RuntimeOptions {
 	return o
 }
 func (o RuntimeOptions) Validate() error {
-	if o.HandlerTimeout < 0 || o.RetryDelay < 0 || o.DeliveryTimeout < 0 || o.OperationTimeout < 0 || o.MaxPollInterval < 0 || o.SessionTimeout < 0 {
+	if o.VisibilityTimeout < 0 || o.HandlerTimeout < 0 || o.RetryDelay < 0 || o.DeliveryTimeout < 0 || o.OperationTimeout < 0 || o.MaxPollInterval < 0 || o.SessionTimeout < 0 {
 		return errors.New("worker: negative runtime duration")
 	}
 	o = o.defaults()
+	if o.VisibilityTimeout < 30*time.Millisecond || o.VisibilityTimeout > 24*time.Hour || o.VisibilityTimeout < 3*o.OperationTimeout {
+		return errors.New("worker: visibilityTimeout must be 30ms..24h and at least 3*operationTimeout")
+	}
 	if o.HandlerTimeout > 24*time.Hour || o.RetryDelay > 24*time.Hour || o.DeliveryTimeout > 24*time.Hour || o.OperationTimeout > 24*time.Hour {
 		return errors.New("worker: runtime duration exceeds 24 hours")
 	}
@@ -276,7 +283,7 @@ func (o *RuntimeOptions) UnmarshalJSON(data []byte) error {
 		return errors.New("worker: invalid runtime options")
 	}
 	var next RuntimeOptions
-	targets := map[string]*time.Duration{"handlerTimeout": &next.HandlerTimeout, "retryDelay": &next.RetryDelay, "deliveryTimeout": &next.DeliveryTimeout, "operationTimeout": &next.OperationTimeout, "sessionTimeout": &next.SessionTimeout, "maxPollInterval": &next.MaxPollInterval}
+	targets := map[string]*time.Duration{"visibilityTimeout": &next.VisibilityTimeout, "handlerTimeout": &next.HandlerTimeout, "retryDelay": &next.RetryDelay, "deliveryTimeout": &next.DeliveryTimeout, "operationTimeout": &next.OperationTimeout, "sessionTimeout": &next.SessionTimeout, "maxPollInterval": &next.MaxPollInterval}
 	for key, raw := range fields {
 		target, ok := targets[key]
 		if !ok {

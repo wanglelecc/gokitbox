@@ -1,26 +1,30 @@
 package failmode
 
 import (
+	"errors"
 	"github.com/wanglelecc/gokitbox/producer/meta"
+	"log"
 )
 
-func init() {
-	AddFailMode(meta.RETRY, InitRetry)
-}
+var ErrRetryFull = errors.New("producer: legacy retry queue full")
 
-func InitRetry() (FailMode, error) {
-	r := new(Retry)
-	return r, nil
-}
+func init()                        { AddFailMode(meta.RETRY, InitRetry) }
+func InitRetry() (FailMode, error) { return &Retry{}, nil }
 
-type Retry struct {
-}
+type Retry struct{}
 
-func (r *Retry) Do(fallback chan<- []byte, message []byte, data []byte, keyParams []interface{}) {
-	// 使用 select + default 避免阻塞，如果 channel 已满则丢弃消息
+// TryDo provides an explicit result for the historical retry adapter. Native
+// Kafka uses its own bounded retry scheduler and does not traverse this channel.
+func (r *Retry) TryDo(fallback chan<- []byte, message []byte) error {
 	select {
 	case fallback <- message:
+		return nil
 	default:
-		// channel 已满，避免阻塞，消息丢失
+		return ErrRetryFull
+	}
+}
+func (r *Retry) Do(fallback chan<- []byte, message, data []byte, keyParams []interface{}) {
+	if err := r.TryDo(fallback, message); err != nil {
+		log.Printf("producer legacy retry failed: %v", err)
 	}
 }

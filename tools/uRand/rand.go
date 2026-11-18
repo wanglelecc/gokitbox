@@ -28,8 +28,8 @@ func NewRandInt(n int) int {
 	max := big.NewInt(int64(n))
 	v, err := rand.Int(rand.Reader, max)
 	if err != nil {
-		// crypto/rand 失败时回退（极少发生）
-		return 0
+		// Entropy failure must not create a predictable security value.
+		panic(err)
 	}
 	return int(v.Int64())
 }
@@ -46,7 +46,14 @@ func NewRandIntRange(min, max int) int {
 	if min >= max {
 		return min
 	}
-	return min + NewRandInt(max-min+1)
+	width := new(big.Int).Sub(big.NewInt(int64(max)), big.NewInt(int64(min)))
+	width.Add(width, big.NewInt(1))
+	value, err := rand.Int(rand.Reader, width)
+	if err != nil {
+		panic(err)
+	}
+	value.Add(value, big.NewInt(int64(min)))
+	return int(value.Int64())
 }
 
 // NewRandString 生成指定长度的随机字母数字字符串，常用于验证码、临时 key
@@ -66,8 +73,7 @@ func NewRandString(n int) string {
 	for i := 0; i < n; i++ {
 		v, err := rand.Int(rand.Reader, max)
 		if err != nil {
-			b[i] = letterBytes[0]
-			continue
+			panic(err)
 		}
 		b[i] = letterBytes[v.Int64()]
 	}
@@ -89,7 +95,7 @@ func NewRandHex(n int) string {
 	// 每字节生成 2 个十六进制字符
 	bytes := make([]byte, (n+1)/2)
 	if _, err := rand.Read(bytes); err != nil {
-		return ""
+		panic(err)
 	}
 	return hex.EncodeToString(bytes)[:n]
 }

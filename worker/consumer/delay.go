@@ -153,6 +153,9 @@ func (d *DelayConsumer) consume(client *redis.Client, config *DelayConfig) {
 // doConsume 单次消费生命周期
 // 返回 true 表示收到 quit 信号，正常退出；false 表示异常，外层需重启
 func (d *DelayConsumer) doConsume(ctx context.Context, client *redis.Client, config *DelayConfig, bo *backoff) (exitClean bool) {
+	if config.DeliveryMode != "legacy" {
+		return d.runtime.consumeReliable(ctx, d.quit, client, config.Queue, "delay", config.FailQueue, config.FailCount, config.TplName, d.callback, &d.successCount, &d.errorCount)
+	}
 	defer func() {
 		if p := recover(); p != nil {
 			atomic.AddInt64(&d.panicCount, 1)
